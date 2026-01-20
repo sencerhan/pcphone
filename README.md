@@ -17,7 +17,25 @@ GTK3-based application that makes your PC appear as a Bluetooth headset. The pho
 - Bluetooth adapter (USB or built-in)
 - PulseAudio or PipeWire
 
-## 🚀 One-Click Installation and Running
+## � Snap Installation (Recommended)
+
+```bash
+sudo snap install pcphone --classic
+```
+
+### ⚠️ Important: WirePlumber Configuration
+
+If you use PipeWire (Ubuntu 22.04+), you must disable WirePlumber's HFP handling for PcPhone to work:
+
+```bash
+mkdir -p ~/.config/wireplumber/bluetooth.lua.d
+echo 'bluez_monitor.properties = { ["bluez5.headset-roles"] = "[ ]" }' > ~/.config/wireplumber/bluetooth.lua.d/51-disable-hfp.lua
+systemctl --user restart wireplumber
+```
+
+This allows PcPhone to control the HFP (Hands-Free Profile) connection directly.
+
+## 🚀 One-Click Installation and Running (Manual)
 
 ```bash
 ./scripts/run.sh

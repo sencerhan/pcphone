@@ -191,10 +191,19 @@ static Contact all_contacts[2000];
 static int all_contacts_count = 0;
 static gboolean phonebook_loaded = FALSE;
 
-// CSV file paths
-#define CONTACTS_CSV "contacts.csv"
-#define RECENTS_CSV "recents.csv"
-#define SETTINGS_JSON "settings.json"
+// CSV file paths (will be set dynamically for snap)
+static char contacts_csv_path[512] = "contacts.csv";
+static char recents_csv_path[512] = "recents.csv";
+static char settings_json_path[512] = "settings.json";
+
+static void init_data_paths(void) {
+    const char *snap_common = getenv("SNAP_USER_COMMON");
+    if (snap_common) {
+        snprintf(contacts_csv_path, sizeof(contacts_csv_path), "%s/contacts.csv", snap_common);
+        snprintf(recents_csv_path, sizeof(recents_csv_path), "%s/recents.csv", snap_common);
+        snprintf(settings_json_path, sizeof(settings_json_path), "%s/settings.json", snap_common);
+    }
+}
 
 // Column widths (default values)
 static int col_recent_type = 80;
@@ -319,7 +328,7 @@ static uint8_t find_hfp_channel(const char *addr) {
 // ============================================================================
 
 static void save_contacts_to_csv(void) {
-    FILE *f = fopen(CONTACTS_CSV, "w");
+    FILE *f = fopen(contacts_csv_path, "w");
     if (!f) return;
     fprintf(f, "name,number\n");
     for (int i = 0; i < all_contacts_count; i++) {
@@ -330,7 +339,7 @@ static void save_contacts_to_csv(void) {
 }
 
 static gboolean load_contacts_from_csv(void) {
-    FILE *f = fopen(CONTACTS_CSV, "r");
+    FILE *f = fopen(contacts_csv_path, "r");
     if (!f) return FALSE;
     
     char line[512];
@@ -365,7 +374,7 @@ static gboolean load_contacts_from_csv(void) {
 }
 
 static void save_recents_to_csv(void) {
-    FILE *f = fopen(RECENTS_CSV, "w");
+    FILE *f = fopen(recents_csv_path, "w");
     if (!f) return;
     fprintf(f, "type,name,number,time\n");
     for (int i = 0; i < recent_count; i++) {
@@ -377,7 +386,7 @@ static void save_recents_to_csv(void) {
 }
 
 static gboolean load_recents_from_csv(void) {
-    FILE *f = fopen(RECENTS_CSV, "r");
+    FILE *f = fopen(recents_csv_path, "r");
     if (!f) return FALSE;
     
     char line[512];
@@ -557,7 +566,7 @@ static const char *lookup_contact_name(const char *number) {
 // ============================================================================
 
 static void load_settings(void) {
-    FILE *f = fopen(SETTINGS_JSON, "r");
+    FILE *f = fopen(settings_json_path, "r");
     if (!f) return;
     
     char line[256];
@@ -577,7 +586,7 @@ static void load_settings(void) {
 
 
 static void save_settings(void) {
-    FILE *f = fopen(SETTINGS_JSON, "w");
+    FILE *f = fopen(settings_json_path, "w");
     if (!f) return;
     
     fprintf(f, "{\n");
@@ -717,6 +726,7 @@ static gboolean ensure_obexd_running(void) {
     gchar *addr = NULL;
     const gchar *sudo_user = NULL;
     const gchar *sudo_uid = NULL;
+    const char *snap = getenv("SNAP");
 
     // Check existing session bus first
     const gchar *env_addr = g_getenv("DBUS_SESSION_BUS_ADDRESS");
@@ -734,6 +744,19 @@ static gboolean ensure_obexd_running(void) {
                 if (g_file_test(bus_path, G_FILE_TEST_EXISTS)) {
                     addr = g_strdup_printf("unix:path=%s", bus_path);
                     log_msg("ℹ️ Found user session bus");
+                }
+                g_free(bus_path);
+            }
+        }
+        
+        // In snap, try XDG_RUNTIME_DIR
+        if (!addr && snap) {
+            const gchar *runtime_dir = g_getenv("XDG_RUNTIME_DIR");
+            if (runtime_dir) {
+                gchar *bus_path = g_strdup_printf("%s/bus", runtime_dir);
+                if (g_file_test(bus_path, G_FILE_TEST_EXISTS)) {
+                    addr = g_strdup_printf("unix:path=%s", bus_path);
+                    log_msg("ℹ️ Using XDG_RUNTIME_DIR bus");
                 }
                 g_free(bus_path);
             }
@@ -782,8 +805,69 @@ static gboolean ensure_obexd_running(void) {
         error = NULL;
     }
 
-    // obexd not running, start it as user
+    // obexd not running, start it (but NOT in snap - can't due to AppArmor)
     gboolean started = FALSE;
+    
+    // In snap environment, we CANNOT start obexd due to AppArmor restrictions
+    // We must rely on the host system's obexd service
+    if (snap) {
+        log_msg("ℹ️ Checking host obexd service...");
+        GDBusConnection *session = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+        if (session) {
+            // Check if obexd is running by checking org.bluez.obex.Client1
+            GVariant *check = g_dbus_connection_call_sync(
+                session,
+                "org.bluez.obex",
+                "/org/bluez/obex",
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                g_variant_new("(s)", "org.bluez.obex.Client1"),
+                G_VARIANT_TYPE("(a{sv})"),
+                G_DBUS_CALL_FLAGS_NONE,
+                3000,
+                NULL,
+                &error);
+            
+            if (check) {
+                g_variant_unref(check);
+                obex_conn = g_object_ref(session);
+                log_msg("✓ Using host obexd service");
+                g_object_unref(session);
+                g_free(addr);
+                return TRUE;
+            }
+            
+            if (error) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "ℹ️ obexd check: %s", error->message);
+                log_msg(msg);
+                g_error_free(error);
+                error = NULL;
+            }
+            
+            // Try alternative: just use the session bus directly
+            // obexd might be available even if Introspect fails
+            obex_conn = g_object_ref(session);
+            log_msg("✓ Using session bus for obexd");
+            g_object_unref(session);
+            g_free(addr);
+            return TRUE;
+        }
+        if (error) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "⚠️ Session bus error: %s", error->message);
+            log_msg(msg);
+            g_error_free(error);
+            error = NULL;
+        }
+        
+        // In snap, we can't start obexd ourselves
+        log_msg("⚠️ obexd not available");
+        g_free(addr);
+        return FALSE;
+    }
+    
+    // Non-snap environment: start obexd ourselves
     if (sudo_user && *sudo_user) {
         // Start obexd with sudo -u <user>
         gchar *cmd = g_strdup_printf(
@@ -797,15 +881,17 @@ static gboolean ensure_obexd_running(void) {
             usleep(500000); // 500ms wait
         }
     } else {
-        // Running as normal user
+        // Running as normal user (not in snap, not sudo)
         const char *candidates[] = {
-            "/usr/libexec/bluetooth/obexd",
             "/usr/lib/bluetooth/obexd",
+            "/usr/libexec/bluetooth/obexd",
+            "/usr/lib/x86_64-linux-gnu/bluetooth/obexd",
             "obexd",
             NULL
         };
 
         for (int i = 0; candidates[i]; i++) {
+            if (!candidates[i] || !candidates[i][0]) continue;
             gchar *argv[] = { (gchar *)candidates[i], (gchar *)"-n", NULL };
             gchar **envp = g_get_environ();
             envp = g_environ_setenv(envp, "DBUS_SESSION_BUS_ADDRESS", addr, TRUE);
@@ -921,6 +1007,9 @@ static void parse_vcf_contacts(const char *file_path) {
 static void parse_vcf_recents(const char *file_path, const char *type_label) {
     FILE *f = fopen(file_path, "r");
     if (!f) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "   ⚠️ Cannot open: %s (errno=%d)", file_path, errno);
+        log_msg(msg);
         return;
     }
 
@@ -929,8 +1018,11 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
     char number[64] = {0};
     char datetime[64] = {0};
     char raw_datetime[20] = {0};
+    int line_count = 0;
+    int vcard_count = 0;
 
     while (fgets(line, sizeof(line), f)) {
+        line_count++;
         if (g_str_has_prefix(line, "FN:")) {
             strncpy(name, line + 3, sizeof(name) - 1);
             char *nl = strchr(name, '\n'); if (nl) *nl = '\0';
@@ -970,6 +1062,7 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
                 }
             }
         } else if (g_str_has_prefix(line, "END:VCARD")) {
+            vcard_count++;
             if (number[0]) {
                 if (recent_count < (int)(sizeof(recent_entries) / sizeof(recent_entries[0]))) {
                     RecentEntry *entry = &recent_entries[recent_count++];
@@ -986,6 +1079,10 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
             memset(raw_datetime, 0, sizeof(raw_datetime));
         }
     }
+
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "   (lines=%d vcards=%d)", line_count, vcard_count);
+    log_msg(dbg);
 
     fclose(f);
 }
@@ -1807,7 +1904,13 @@ static gpointer sync_recents_thread(gpointer data) {
         }
         
         if (filename) {
+            char log_buf[512];
+            snprintf(log_buf, sizeof(log_buf), "📁 Parsing %s: %s", types[pb], filename);
+            log_msg(log_buf);
+            int before = recent_count;
             parse_vcf_recents(filename, types[pb]);
+            snprintf(log_buf, sizeof(log_buf), "   → %d records added", recent_count - before);
+            log_msg(log_buf);
             g_free(filename);
             any_success = TRUE;
         }
@@ -2100,7 +2203,9 @@ static gpointer incoming_call_listener(gpointer data) {
     str2ba(device_addr, &addr.rc_bdaddr);
     
     if (connect(hfp_listen_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_msg("⚠️ Listener connection error");
+        char err_msg[128];
+        snprintf(err_msg, sizeof(err_msg), "⚠️ Listener connection error (errno=%d: %s)", errno, strerror(errno));
+        log_msg(err_msg);
         close(hfp_listen_socket);
         hfp_listen_socket = -1;
         return NULL;
@@ -2770,9 +2875,11 @@ static gboolean hfp_dial(const char *number) {
     // Connect
     log_msg("📱 Establishing HFP connection...");
     if (connect(hfp_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        char err_msg[128];
+        snprintf(err_msg, sizeof(err_msg), "⚠️ HFP connection failed (errno=%d: %s)", errno, strerror(errno));
+        log_msg(err_msg);
         close(hfp_socket);
         hfp_socket = -1;
-        log_msg("⚠️ HFP connection failed");
         return FALSE;
     }
     
@@ -3243,10 +3350,11 @@ static void update_ui(void) {
             css_class = "status-pairing";
             break;
         case STATE_PAIRED:
-            snprintf(status_text, sizeof(status_text), "✓ Paired");
+            snprintf(status_text, sizeof(status_text), "✓ Paired - Ready");
             snprintf(info_text, sizeof(info_text),
                      "Device: %s\nAddress: %s\n\n"
-                     "Trying auto-connect...",
+                     "Press 'Start' to connect.\n"
+                     "Or connect from your phone.",
                      device_name[0] ? device_name : "Unknown",
                      device_addr[0] ? device_addr : "-" );
             css_class = "status-paired";
@@ -3289,8 +3397,10 @@ static void update_ui(void) {
     gtk_style_context_remove_class(ctx, "status-error");
     gtk_style_context_add_class(ctx, css_class);
 
-    gtk_widget_set_sensitive(start_btn, current_state == STATE_IDLE);
-    gtk_widget_set_sensitive(stop_btn, current_state == STATE_DISCOVERABLE || current_state == STATE_PAIRED);
+    // Start: available in IDLE or PAIRED (to reconnect)
+    gtk_widget_set_sensitive(start_btn, current_state == STATE_IDLE || current_state == STATE_PAIRED);
+    // Stop: available when discovering or connecting
+    gtk_widget_set_sensitive(stop_btn, current_state == STATE_DISCOVERABLE || current_state == STATE_CONNECTING);
     gtk_widget_set_sensitive(disconnect_btn, current_state == STATE_CONNECTED);
     gtk_widget_set_sensitive(contacts_search_entry, current_state == STATE_CONNECTED && !syncing_contacts);
     gtk_widget_set_sensitive(sync_recents_btn, current_state == STATE_CONNECTED && !syncing_recents);
@@ -3472,24 +3582,34 @@ static const GDBusInterfaceVTable agent_vtable = {
 static gboolean register_agent(void) {
     GError *error = NULL;
 
-    agent_introspection = g_dbus_node_info_new_for_xml(agent_xml, &error);
-    if (error) {
-        snprintf(error_msg, sizeof(error_msg), "Agent XML error: %s", error->message);
-        g_error_free(error);
-        return FALSE;
+    // Only parse introspection once
+    if (!agent_introspection) {
+        agent_introspection = g_dbus_node_info_new_for_xml(agent_xml, &error);
+        if (error) {
+            snprintf(error_msg, sizeof(error_msg), "Agent XML error: %s", error->message);
+            g_error_free(error);
+            return FALSE;
+        }
     }
 
-    agent_registration_id = g_dbus_connection_register_object(
-        dbus_conn,
-        "/org/bluez/agent",
-        agent_introspection->interfaces[0],
-        &agent_vtable,
-        NULL, NULL, &error);
+    // Only register object if not already registered
+    if (agent_registration_id == 0) {
+        agent_registration_id = g_dbus_connection_register_object(
+            dbus_conn,
+            "/org/bluez/agent",
+            agent_introspection->interfaces[0],
+            &agent_vtable,
+            NULL, NULL, &error);
 
-    if (error) {
-        snprintf(error_msg, sizeof(error_msg), "Agent registration error: %s", error->message);
-        g_error_free(error);
-        return FALSE;
+        if (error) {
+            // Ignore "already registered" errors
+            if (!strstr(error->message, "already exported")) {
+                snprintf(error_msg, sizeof(error_msg), "Agent registration error: %s", error->message);
+                g_error_free(error);
+                return FALSE;
+            }
+            g_error_free(error);
+        }
     }
 
     GVariant *result = g_dbus_connection_call_sync(
@@ -4087,7 +4207,14 @@ static void on_start_clicked(GtkWidget *widget, gpointer data) {
     }
 
     make_discoverable(TRUE);
-    set_state(STATE_DISCOVERABLE);
+    
+    // If we have a paired device, try to connect; otherwise wait for pairing
+    if (device_path[0] && device_paired) {
+        set_state(STATE_PAIRED);
+        try_auto_connect();
+    } else {
+        set_state(STATE_DISCOVERABLE);
+    }
     update_ui();
 }
 
@@ -4095,7 +4222,13 @@ static void on_stop_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
 
     make_discoverable(FALSE);
-    set_state(STATE_IDLE);
+    
+    // Preserve PAIRED state if we have a paired device
+    if (device_path[0] && device_paired) {
+        set_state(STATE_PAIRED);
+    } else {
+        set_state(STATE_IDLE);
+    }
     update_ui();
 }
 
@@ -4626,9 +4759,20 @@ static void on_app_command_line(GApplication *application, GApplicationCommandLi
 // ============================================================================
 
 int main(int argc, char *argv[]) {
-    // GtkApplication oluştur - tek instance garantisi
-    app = gtk_application_new("com.ancientcoder.pcphone", 
-                               G_APPLICATION_HANDLES_COMMAND_LINE);
+    // Initialize data paths for snap or regular environment
+    init_data_paths();
+    
+    // Check if running in snap environment
+    const char *snap = getenv("SNAP");
+    GApplicationFlags flags = G_APPLICATION_HANDLES_COMMAND_LINE;
+    
+    // In snap, D-Bus registration may fail due to AppArmor - use NON_UNIQUE to bypass
+    if (snap) {
+        flags |= G_APPLICATION_NON_UNIQUE;
+    }
+    
+    // GtkApplication oluştur
+    app = gtk_application_new("com.ancientcoder.pcphone", flags);
     
     g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), NULL);
     g_signal_connect(app, "command-line", G_CALLBACK(on_app_command_line), NULL);
