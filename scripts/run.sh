@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TARGET="bt_headset_gui"
+TARGET="pc_phone_gui"
 
 # Renk kodları
 RED='\033[0;31m'
@@ -26,14 +26,14 @@ echo ""
 cd "$PROJECT_DIR"
 
 # İlk kurulum kontrolü
-if [ ! -f ".bt_headset_backup/changes.txt" ]; then
+if [ ! -f ".pc_phone_backup/changes.txt" ]; then
   log_info "İlk kurulum algılandı, setup çalıştırılıyor..."
   "$SCRIPT_DIR/setup.sh"
   echo ""
 fi
 
 # Derleme gerekli mi?
-if [ ! -f "$TARGET" ] || [ "bt_headset_gui.c" -nt "$TARGET" ]; then
+if [ ! -f "$TARGET" ] || [ "pc_phone_gui.c" -nt "$TARGET" ]; then
   log_info "Derleniyor..."
   make gui
   echo ""

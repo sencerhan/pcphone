@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BACKUP_DIR="$PROJECT_DIR/.bt_headset_backup"
+BACKUP_DIR="$PROJECT_DIR/.pc_phone_backup"
 MAIN_CONF="/etc/bluetooth/main.conf"
 
 # Renk kodları

@@ -1,114 +1,111 @@
-# 🎧 Bluetooth Kulaklık Simülatörü (GUI / Pasif Mod)
+# 🎧 Bluetooth Headset Simulator (GUI / Passive Mode)
 
-PC'nizi Bluetooth kulaklık gibi gösteren GTK3 tabanlı uygulama. Telefon bağlanır, PC pasif olarak kabul eder. Rehber ve son görüşmeler PBAP ile çekilir.
+GTK3-based application that makes your PC appear as a Bluetooth headset. The phone connects, PC accepts passively. Contacts and recent calls are fetched via PBAP.
 
-## ✨ Özellikler
+## ✨ Features
 
-- 🔌 Pasif Mod
-- 🔗 Otomatik eşleşme ve bağlantı
-- 📇 PBAP rehber
-- 🕘 PBAP son görüşmeler
-- 📞 Arama arayüzü
-- 🔍 HFP kanalı otomatik SDP ile bulunur
-- 📊 SCO MTU dinamik okunur
+- 🔗 Automatic pairing and connection
+- 📇 PBAP contacts
+- 🕘 PBAP recent calls
+- 📞 Call interface
+- 🔍 HFP channel automatically found via SDP
+- 📊 SCO MTU dynamically read
 
-## 📋 Gereksinimler
+## 📋 Requirements
 
 - Linux (Ubuntu 20.04+, Fedora, Arch)
-- Bluetooth adaptörü (USB veya dahili)
-- PulseAudio veya PipeWire
+- Bluetooth adapter (USB or built-in)
+- PulseAudio or PipeWire
 
-## 🚀 Tek Tıkla Kurulum ve Çalıştırma
+## 🚀 One-Click Installation and Running
 
 ```bash
 ./scripts/run.sh
 ```
 
-Bu komut otomatik olarak:
-- ✅ Gerekli paketleri kurar
-- ✅ Bluetooth ayarlarını yapılandırır
-- ✅ main.conf'u düzenler (yedek alır)
-- ✅ Kullanıcıyı bluetooth grubuna ekler
-- ✅ Programı derler
-- ✅ Capability ekler
-- ✅ Programı başlatır
+This command automatically:
+- ✅ Installs required packages
+- ✅ Configures Bluetooth settings
+- ✅ Edits main.conf (takes backup)
+- ✅ Adds user to bluetooth group
+- ✅ Compiles the program
+- ✅ Adds capabilities
+- ✅ Starts the program
 
-## 🗑️ Temiz Kaldırma
+## 🗑️ Clean Uninstall
 
 ```bash
 make uninstall
-# veya
+# or
 ./scripts/uninstall.sh
 ```
 
-Bu komut:
-- ✅ Sistem binary'sini kaldırır
-- ✅ main.conf'u eski haline getirir
-- ✅ Bluetooth grup üyeliğini geri alır
-- ✅ Derleme dosyalarını temizler
-- ✅ (Opsiyonel) Kullanıcı verilerini siler
+This command:
+- ✅ Removes system binary
+- ✅ Restores main.conf to original
+- ✅ Revokes Bluetooth group membership
+- ✅ Cleans build files
+- ✅ (Optional) Deletes user data
 
-## 📱 İlk Kullanım
+## 📱 First Use
 
-1. `./scripts/run.sh` çalıştırın
-2. Telefonunuzun Bluetooth ayarlarından PC'yi bulun
-3. Eşleştirin ve "Handsfree" olarak bağlayın
-4. Programda "Başlat" butonuna basın
+1. Run `./scripts/run.sh`
+2. Find the PC in your phone's Bluetooth settings
+3. Pair and connect as "Handsfree"
+4. Press the "Start" button in the program
 
-**Not:** İlk kurulumdan sonra oturumu kapatıp açmanız gerekebilir (bluetooth grubu için).
+**Note:** After first installation, you may need to log out and back in (for bluetooth group).
 
-## 🔧 Manuel Komutlar
+## 🔧 Manual Commands
 
-| Komut | Açıklama |
+| Command | Description |
+|---------|-------------|
+| `make run` | One-click run |
+| `make gui` | Compile only |
+| `make setup` | Setup only |
+| `make install` | Install to system (/usr/local/bin) |
+| `make uninstall` | Clean uninstall (restore settings) |
+| `make clean` | Clean build files |
+
+## 🐛 Troubleshooting
+
+| Issue | Solution |
 |-------|----------|
-| `make run` | Tek tıkla çalıştır |
-| `make gui` | Sadece derle |
-| `make setup` | Sadece kurulum yap |
-| `make install` | Sisteme kur (/usr/local/bin) |
-| `make uninstall` | Temiz kaldır (ayarları geri al) |
-| `make clean` | Derleme dosyalarını temizle |
+| Permission denied | `newgrp bluetooth` or restart session |
+| Phone not connecting | `bluetoothctl` set discoverable on |
+| SCO connection failed | Re-pair the phone |
+| No sound | Check PulseAudio Bluetooth module |
 
-## 🐛 Sorun Giderme
-
-| Sorun | Çözüm |
-|-------|-------|
-| Permission denied | `newgrp bluetooth` veya oturumu yeniden aç |
-| Telefon bağlanmıyor | `bluetoothctl` ile discoverable on |
-| SCO bağlantısı başarısız | Telefonu yeniden eşleştirin |
-| Ses gelmiyor | PulseAudio Bluetooth modülünü kontrol edin |
-
-### Bluetooth Durumunu Kontrol Et
+### Check Bluetooth Status
 ```bash
-# Adaptör durumu
+# Adapter status
 hciconfig
 
-# Bağlı cihazlar
+# Connected devices
 bluetoothctl devices Connected
 
-# Servis durumu
+# Service status
 systemctl status bluetooth
 ```
 
-## 📁 Dosya Yapısı
+## 📁 File Structure
 
 ```
 blue/
-├── bt_headset_gui.c       # Ana uygulama
-├── Makefile               # Derleme komutları
+├── pc_phone_gui.c       # Main application
+├── Makefile               # Build commands
 ├── scripts/
-│   ├── run.sh             # Tek tıkla çalıştır
-│   ├── setup.sh           # Kurulum (backup alır)
-│   └── uninstall.sh       # Kaldır (backup'tan geri yükler)
-├── .bt_headset_backup/    # Otomatik yedekler
-│   ├── main.conf.bak      # Orijinal Bluetooth ayarları
-│   └── changes.txt        # Yapılan değişiklikler
-├── settings.json          # Kullanıcı ayarları (sütun genişlikleri)
-├── contacts.csv           # Rehber önbelleği
-└── recents.csv            # Son aramalar önbelleği
+│   ├── run.sh             # One-click run
+│   ├── setup.sh           # Setup (takes backup)
+│   └── uninstall.sh       # Uninstall (restore from backup)
+├── .pc_phone_backup/    # Automatic backups
+│   ├── main.conf.bak      # Original Bluetooth settings
+│   └── changes.txt        # Changes made
+├── settings.json          # User settings (column widths)
+├── contacts.csv           # Contacts cache
+└── recents.csv            # Recent calls cache
 ```
 
-## 🔐 Güvenlik Notları
+## 🔐 Security Notes
 
-⚠️ **Uyarı:** Bu program deneyseldir. Kritik aramalar için telefonunuzu doğrudan kullanın.
-
-
+⚠️ **Warning:** This program is experimental. Use your phone directly for critical calls.

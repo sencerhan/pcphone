@@ -1,10 +1,10 @@
 /*
- * Bluetooth Headset Simulator - Passive Mode
+ * PcPhone - Bluetooth Phone for PC
  * Phone connects, PC just accepts
  * Automatic pairing + automatic connection
  *
  * Build: make gui
- * Run: sudo ./bt_headset_gui
+ * Run: sudo ./pc_phone_gui
  */
 
 #include <gtk/gtk.h>
@@ -18,6 +18,7 @@
 #include <gio/gio.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/sco.h>
@@ -202,6 +203,13 @@ static int col_recent_number = 120;
 static int col_recent_time = 140;
 static int col_contacts_name = 200;
 static int col_contacts_number = 150;
+
+// Autostart setting
+static gboolean autostart_enabled = FALSE;
+
+// GtkApplication for single instance
+static GtkApplication *app = NULL;
+static char pending_uri_arg[256] = "";
 
 // Forward declarations
 static void update_ui(void);
@@ -561,6 +569,8 @@ static void load_settings(void) {
         else if (sscanf(line, " \"col_recent_time\" : %d", &val) == 1) col_recent_time = val;
         else if (sscanf(line, " \"col_contacts_name\" : %d", &val) == 1) col_contacts_name = val;
         else if (sscanf(line, " \"col_contacts_number\" : %d", &val) == 1) col_contacts_number = val;
+        else if (strstr(line, "\"autostart\"") && strstr(line, "true")) autostart_enabled = TRUE;
+        else if (strstr(line, "\"autostart\"") && strstr(line, "false")) autostart_enabled = FALSE;
     }
     fclose(f);
 }
@@ -576,9 +586,63 @@ static void save_settings(void) {
     fprintf(f, "  \"col_recent_number\": %d,\n", col_recent_number);
     fprintf(f, "  \"col_recent_time\": %d,\n", col_recent_time);
     fprintf(f, "  \"col_contacts_name\": %d,\n", col_contacts_name);
-    fprintf(f, "  \"col_contacts_number\": %d\n", col_contacts_number);
+    fprintf(f, "  \"col_contacts_number\": %d,\n", col_contacts_number);
+    fprintf(f, "  \"autostart\": %s\n", autostart_enabled ? "true" : "false");
     fprintf(f, "}\n");
     fclose(f);
+}
+
+// Autostart yönetimi
+static gboolean is_autostart_enabled(void) {
+    char path[512];
+    const char *home = getenv("HOME");
+    if (!home) return FALSE;
+    snprintf(path, sizeof(path), "%s/.config/autostart/pcphone.desktop", home);
+    return access(path, F_OK) == 0;
+}
+
+static void set_autostart(gboolean enable) {
+    char autostart_dir[512];
+    char autostart_file[512];
+    const char *home = getenv("HOME");
+    if (!home) return;
+    
+    snprintf(autostart_dir, sizeof(autostart_dir), "%s/.config/autostart", home);
+    snprintf(autostart_file, sizeof(autostart_file), "%s/pcphone.desktop", autostart_dir);
+    
+    if (enable) {
+        // Dizin yoksa oluştur
+        mkdir(autostart_dir, 0755);
+        
+        // .desktop dosyası oluştur
+        FILE *f = fopen(autostart_file, "w");
+        if (f) {
+            fprintf(f, "[Desktop Entry]\n");
+            fprintf(f, "Type=Application\n");
+            fprintf(f, "Name=PcPhone\n");
+            fprintf(f, "Name[tr]=PcPhone\n");
+            fprintf(f, "Comment=Bluetooth Phone\n");
+            fprintf(f, "Comment[tr]=Bluetooth Telefon\n");
+            fprintf(f, "Exec=/usr/bin/pcphone\n");
+            fprintf(f, "Icon=call-start\n");
+            fprintf(f, "Terminal=false\n");
+            fprintf(f, "Categories=Network;Telephony;\n");
+            fprintf(f, "X-GNOME-Autostart-enabled=true\n");
+            fclose(f);
+            autostart_enabled = TRUE;
+        }
+    } else {
+        // Dosyayı sil
+        unlink(autostart_file);
+        autostart_enabled = FALSE;
+    }
+    save_settings();
+}
+
+static void on_autostart_toggled(GtkToggleButton *button, gpointer data) {
+    (void)data;
+    gboolean active = gtk_toggle_button_get_active(button);
+    set_autostart(active);
 }
 
 // GTK destroy callback wrapper
@@ -2354,7 +2418,7 @@ static void* sco_playback_thread_func(void *data) {
     int err;
     pulse_playback = pa_simple_new(
         NULL,               // default server
-        "BT Headset",       // app name
+        "PCPhone",       // app name
         PA_STREAM_PLAYBACK,
         NULL,               // default device
         "Phone Audio",      // stream description
@@ -2419,7 +2483,7 @@ static void* sco_capture_thread_func(void *data) {
     int err;
     pulse_capture = pa_simple_new(
         NULL,               // default server
-        "BT Headset",       // app name
+        "PcPhone",       // app name
         PA_STREAM_RECORD,
         NULL,               // default device (microphone)
         "PC Microphone",    // stream description
@@ -4166,7 +4230,7 @@ static void apply_css(void) {
 
 static void create_ui(void) {
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Bluetooth Headset Simulator");
+    gtk_window_set_title(GTK_WINDOW(window), "PcPhone");
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 650);
     gtk_container_set_border_width(GTK_CONTAINER(window), 12);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
@@ -4179,7 +4243,7 @@ static void create_ui(void) {
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(main_vbox), header_box, FALSE, FALSE, 0);
 
-    GtkWidget *title = gtk_label_new("🎧 BT Headset");
+    GtkWidget *title = gtk_label_new("🎧 PcPhone");
     GtkStyleContext *ctx = gtk_widget_get_style_context(title);
     gtk_style_context_add_class(ctx, "title");
     gtk_box_pack_start(GTK_BOX(header_box), title, FALSE, FALSE, 0);
@@ -4247,6 +4311,12 @@ static void create_ui(void) {
         "https://buymeacoffee.com/ancientcoder",
         "❤️ Donate");
     gtk_box_pack_start(GTK_BOX(call_btn_box), donate_btn, TRUE, TRUE, 0);
+    // Autostart checkbox
+    GtkWidget *autostart_check = gtk_check_button_new_with_label("🚀 Autostart");
+    autostart_enabled = is_autostart_enabled();  // Check the actual status
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart_check), autostart_enabled);
+    g_signal_connect(autostart_check, "toggled", G_CALLBACK(on_autostart_toggled), NULL);
+    gtk_box_pack_start(GTK_BOX(call_btn_box), autostart_check, TRUE, TRUE, 0);
 
     // ========== TAB STRUCTURE ==========
     GtkWidget *notebook = gtk_notebook_new();
@@ -4452,38 +4522,42 @@ static void create_ui(void) {
 }
 
 // ============================================================================
-// MAIN
+// APPLICATION CALLBACKS
 // ============================================================================
 
-int main(int argc, char *argv[]) {
-    gtk_init(&argc, &argv);
-
-    // tel: URI desteği - tarayıcılardan arama
-    if (argc > 1 && argv[1]) {
-        const char *arg = argv[1];
-        // tel:+905551234567 veya tel://+905551234567 formatı
-        if (strncmp(arg, "tel:", 4) == 0) {
-            arg += 4;
-            if (strncmp(arg, "//", 2) == 0) arg += 2;
-            // Numarayı temizle (sadece rakam ve + karakteri)
-            int j = 0;
-            for (int i = 0; arg[i] && j < 63; i++) {
-                if ((arg[i] >= '0' && arg[i] <= '9') || arg[i] == '+') {
-                    pending_dial_number[j++] = arg[i];
-                }
+static void on_app_activate(GtkApplication *application, gpointer user_data) {
+    (void)user_data;
+    
+    // Eğer pencere zaten varsa, öne getir
+    if (window) {
+        gtk_window_present(GTK_WINDOW(window));
+        
+        // Eğer tel: URI ile çağrıldıysa, numarayı işle
+        if (pending_uri_arg[0] != '\0') {
+            strncpy(pending_dial_number, pending_uri_arg, 63);
+            pending_dial_number[63] = '\0';
+            pending_uri_arg[0] = '\0';
+            
+            // Eğer bağlıysa hemen ara
+            if (current_state == STATE_CONNECTED && hfp_socket >= 0) {
+                dial_number(pending_dial_number);
+                pending_dial_number[0] = '\0';
             }
-            pending_dial_number[j] = '\0';
         }
+        return;
     }
-
-    load_settings();  // Load column widths
+    
+    // İlk açılış - UI oluştur
+    load_settings();
     apply_css();
     create_ui();
+    
+    // Pencereyi uygulamaya bağla
+    gtk_application_add_window(application, GTK_WINDOW(window));
 
     // Fast loading from CSV
     if (load_contacts_from_csv()) {
         phonebook_loaded = TRUE;
-        // Copy from all_contacts to contacts (for search)
         contacts_count = 0;
         for (int i = 0; i < all_contacts_count && contacts_count < 200; i++) {
             strncpy(contacts[contacts_count].name, all_contacts[i].name, 127);
@@ -4515,11 +4589,54 @@ int main(int argc, char *argv[]) {
     gtk_widget_show_all(window);
     gtk_widget_hide(spinner);
 
-    log_msg("🎧 Bluetooth Headset Simulator (Passive Mode)");
+    log_msg("📱 PcPhone - Ready");
     log_msg("ℹ️ Press 'Start' button, let phone connect");
+}
 
-    gtk_main();
+static void on_app_command_line(GApplication *application, GApplicationCommandLine *cmdline, gpointer user_data) {
+    (void)user_data;
+    
+    gchar **argv;
+    gint argc;
+    argv = g_application_command_line_get_arguments(cmdline, &argc);
+    
+    // tel: URI kontrolü
+    if (argc > 1 && argv[1]) {
+        const char *arg = argv[1];
+        if (strncmp(arg, "tel:", 4) == 0) {
+            arg += 4;
+            if (strncmp(arg, "//", 2) == 0) arg += 2;
+            int j = 0;
+            for (int i = 0; arg[i] && j < 255; i++) {
+                if ((arg[i] >= '0' && arg[i] <= '9') || arg[i] == '+') {
+                    pending_uri_arg[j++] = arg[i];
+                }
+            }
+            pending_uri_arg[j] = '\0';
+        }
+    }
+    g_strfreev(argv);
+    
+    // Activate tetikle
+    g_application_activate(application);
+}
 
+// ============================================================================
+// MAIN
+// ============================================================================
+
+int main(int argc, char *argv[]) {
+    // GtkApplication oluştur - tek instance garantisi
+    app = gtk_application_new("com.ancientcoder.pcphone", 
+                               G_APPLICATION_HANDLES_COMMAND_LINE);
+    
+    g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), NULL);
+    g_signal_connect(app, "command-line", G_CALLBACK(on_app_command_line), NULL);
+    
+    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    
     make_discoverable(FALSE);
-    return 0;
+    g_object_unref(app);
+    
+    return status;
 }

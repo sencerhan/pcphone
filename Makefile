@@ -10,9 +10,9 @@ DBUS_LIBS = $(shell pkg-config --libs dbus-1 2>/dev/null)
 GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
 GTK_LIBS = $(shell pkg-config --libs gtk+-3.0 2>/dev/null)
 
-TARGET_GUI = bt_headset_gui
-SRC_GUI = bt_headset_gui.c
-OBJ_GUI = bt_headset_gui.o
+TARGET_GUI = pc_phone_gui
+SRC_GUI = pc_phone_gui.c
+OBJ_GUI = pc_phone_gui.o
 
 WEBRTC_CFLAGS = $(shell pkg-config --cflags webrtc-audio-processing 2>/dev/null)
 WEBRTC_LIBS = $(shell pkg-config --libs webrtc-audio-processing 2>/dev/null)
@@ -61,16 +61,16 @@ install: $(TARGET_GUI)
 	sudo setcap 'cap_net_admin,cap_net_raw+eip' /usr/local/bin/$(TARGET_GUI)
 	@echo "tel: URI handler kaydediliyor..."
 	mkdir -p ~/.local/share/applications
-	cp bt_headset_gui.desktop ~/.local/share/applications/
-	xdg-mime default bt_headset_gui.desktop x-scheme-handler/tel
+	cp pc_phone_gui.desktop ~/.local/share/applications/
+	xdg-mime default pc_phone_gui.desktop x-scheme-handler/tel
 	update-desktop-database ~/.local/share/applications 2>/dev/null || true
 	@echo "✓ Kurulum tamamlandı!"
-	@echo "  • 'bt_headset_gui' komutu ile çalıştırabilirsiniz"
+	@echo "  • 'pc_phone_gui' komutu ile çalıştırabilirsiniz"
 	@echo "  • Tarayıcılarda tel: linklerine tıklayınca otomatik arar"
 
 uninstall:
 	@./scripts/uninstall.sh
-	@rm -f ~/.local/share/applications/bt_headset_gui.desktop
+	@rm -f ~/.local/share/applications/pc_phone_gui.desktop
 	@update-desktop-database ~/.local/share/applications 2>/dev/null || true
 	@echo "✓ tel: handler kaldırıldı"
 

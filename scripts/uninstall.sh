@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BACKUP_DIR="$PROJECT_DIR/.bt_headset_backup"
+BACKUP_DIR="$PROJECT_DIR/.pc_phone_backup"
 MAIN_CONF="/etc/bluetooth/main.conf"
 
 # Renk kodları
@@ -43,9 +43,9 @@ restore_group() {
 
 # Binary'yi kaldır
 remove_binary() {
-  if [ -f "/usr/local/bin/bt_headset_gui" ]; then
+  if [ -f "/usr/local/bin/pc_phone_gui" ]; then
     log_info "Sistem binary'si kaldırılıyor..."
-    sudo rm -f /usr/local/bin/bt_headset_gui
+    sudo rm -f /usr/local/bin/pc_phone_gui
     log_ok "Binary kaldırıldı"
   fi
 }
@@ -54,7 +54,7 @@ remove_binary() {
 clean_build() {
   log_info "Derleme dosyaları temizleniyor..."
   cd "$PROJECT_DIR"
-  rm -f bt_headset_gui *.o 2>/dev/null || true
+  rm -f pc_phone_gui *.o 2>/dev/null || true
   log_ok "Derleme dosyaları temizlendi"
 }
 

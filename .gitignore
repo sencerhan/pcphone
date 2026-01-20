@@ -1,0 +1,50 @@
+# Build outputs and temporary folders
+build-deb/
+build/
+stage/
+prime/
+parts/
+*.o
+*.so
+*.a
+*.out
+*.log
+*.swp
+*.bak
+*.tmp
+
+# Snapcraft and packaging
+*.snap
+*.deb
+*.bin
+*.run
+*.sh
+*.desktop
+*.yaml
+
+# Application binaries
+pc_phone_gui
+pcphone
+
+# Data and config files
+*.xml
+*.md
+*.txt
+
+# IDE and system files
+*.DS_Store
+.vscode/
+
+# Ignore export, install, layer, run, state folders inside parts/*
+parts/*/export/
+parts/*/install/
+parts/*/layer/
+parts/*/run/
+parts/*/state/
+
+# Ignore build, export, install, layer, run, state folders inside build-deb/*
+build-deb/*/export/
+build-deb/*/install/
+build-deb/*/layer/
+build-deb/*/run/
+build-deb/*/state/
