@@ -21,8 +21,14 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/sco.h>
+#include <bluetooth/sdp.h>
+#include <bluetooth/sdp_lib.h>
 #include <pulse/simple.h>
 #include <pulse/error.h>
+
+#ifdef HAVE_WEBRTC_APM
+#include "audio_processing_wrapper.h"
+#endif
 
 // SCO voice ayarları (kernel'de tanımlı değilse)
 #ifndef BT_VOICE
@@ -83,6 +89,26 @@ static pa_simple *pulse_playback = NULL;
 static pa_simple *pulse_capture = NULL;
 static GThread *incoming_call_thread = NULL;
 static gboolean incoming_call_running = FALSE;
+static gboolean hfp_listen_paused = FALSE;
+
+// WebRTC AEC
+#define AEC_FRAME_SAMPLES 80  // 10ms @ 8kHz
+#define AEC_FRAME_BYTES (AEC_FRAME_SAMPLES * 2)
+#define AEC_FIFO_CAPACITY (AEC_FRAME_SAMPLES * 50)
+
+static gboolean aec_enabled = FALSE;
+#ifdef HAVE_WEBRTC_APM
+static gboolean aec_force_disable = TRUE;
+#endif
+#ifdef HAVE_WEBRTC_APM
+static AecHandle *aec_handle = NULL;
+#endif
+static pthread_mutex_t aec_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t aec_fifo_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int16_t aec_render_fifo[AEC_FIFO_CAPACITY];
+static int aec_fifo_head = 0;
+static int aec_fifo_tail = 0;
+static int aec_fifo_size = 0;
 
 static GDBusConnection *dbus_conn = NULL;
 static GDBusConnection *obex_conn = NULL;
@@ -96,6 +122,10 @@ static gboolean device_paired = FALSE;
 
 static gboolean auto_connect_in_progress = FALSE;
 
+// Dinamik HFP kanal ve SCO MTU
+static uint8_t hfp_channel = 0;  // 0 = henüz bulunmadı
+static int sco_mtu = 48;  // Varsayılan, bağlantıda güncellenir
+
 // Contacts
 typedef struct {
     char name[128];
@@ -106,14 +136,22 @@ static Contact contacts[200];
 static int contacts_count = 0;
 
 typedef struct {
-    char type[16];
+    char type[24];
     char name[128];
     char number[64];
     char time[64];
+    char raw_time[20];  // Sıralama için: 20260120T031500
 } RecentEntry;
 
 static RecentEntry recent_entries[500];
 static int recent_count = 0;
+
+// Son görüşmeleri zamana göre sırala (en yeniden en eskiye)
+static int compare_recents(const void *a, const void *b) {
+    const RecentEntry *ra = (const RecentEntry *)a;
+    const RecentEntry *rb = (const RecentEntry *)b;
+    return strcmp(rb->raw_time, ra->raw_time);  // Azalan sıra (en yeni önce)
+}
 
 // UI
 static GtkWidget *window;
@@ -153,12 +191,22 @@ static gboolean phonebook_loaded = FALSE;
 // CSV dosya yolları
 #define CONTACTS_CSV "contacts.csv"
 #define RECENTS_CSV "recents.csv"
+#define SETTINGS_JSON "settings.json"
+
+// Sütun genişlikleri (varsayılan değerler)
+static int col_recent_type = 80;
+static int col_recent_name = 150;
+static int col_recent_number = 120;
+static int col_recent_time = 140;
+static int col_contacts_name = 200;
+static int col_contacts_number = 150;
 
 // Forward declarations
 static void update_ui(void);
 static void update_call_ui(void);
 static void clear_call_info(void);
 static gboolean parse_ciev(const char *buf, int *indicator, int *value);
+static void handle_ciev_event(int ind, int val);
 static void stop_sco_audio(const char *reason);
 static void clear_device_info(void);
 static void cleanup_connection(const char *reason, gboolean clear_device);
@@ -168,6 +216,92 @@ static gboolean ensure_obexd_running(void);
 static gpointer sync_recents_thread(gpointer data);
 static gpointer load_phonebook_thread(gpointer data);
 static void set_call_state(CallState new_state);
+static void log_msg(const char *msg);
+
+// ============================================================================
+// SDP - HFP KANAL BULMA
+// ============================================================================
+
+// SDP sorgusu ile HFP-AG kanalını bul
+static uint8_t find_hfp_channel(const char *addr) {
+    bdaddr_t target;
+    str2ba(addr, &target);
+    
+    // SDP session aç
+    sdp_session_t *session = sdp_connect(BDADDR_ANY, &target, SDP_RETRY_IF_BUSY);
+    if (!session) {
+        log_msg("ℹ️ SDP bağlantısı kurulamadı, varsayılan kanal kullanılacak");
+        return 0;
+    }
+    
+    // HFP-AG UUID (0x111F)
+    uuid_t hfp_ag_uuid;
+    sdp_uuid16_create(&hfp_ag_uuid, 0x111F);
+    
+    // Arama listesi
+    sdp_list_t *search_list = sdp_list_append(NULL, &hfp_ag_uuid);
+    
+    // İstenen özellikler
+    uint32_t range = 0x0000ffff;
+    sdp_list_t *attrid_list = sdp_list_append(NULL, &range);
+    
+    // SDP sorgusu yap
+    sdp_list_t *response_list = NULL;
+    int err = sdp_service_search_attr_req(session, search_list, SDP_ATTR_REQ_RANGE, attrid_list, &response_list);
+    
+    sdp_list_free(search_list, NULL);
+    sdp_list_free(attrid_list, NULL);
+    
+    uint8_t channel = 0;
+    
+    if (err == 0 && response_list) {
+        sdp_list_t *r = response_list;
+        for (; r; r = r->next) {
+            sdp_record_t *rec = (sdp_record_t *)r->data;
+            sdp_list_t *proto_list = NULL;
+            
+            if (sdp_get_access_protos(rec, &proto_list) == 0) {
+                sdp_list_t *p = proto_list;
+                for (; p; p = p->next) {
+                    sdp_list_t *pds = (sdp_list_t *)p->data;
+                    for (; pds; pds = pds->next) {
+                        sdp_data_t *d = (sdp_data_t *)pds->data;
+                        int proto = 0;
+                        for (; d; d = d->next) {
+                            switch (d->dtd) {
+                                case SDP_UUID16:
+                                case SDP_UUID32:
+                                case SDP_UUID128:
+                                    proto = sdp_uuid_to_proto(&d->val.uuid);
+                                    break;
+                                case SDP_UINT8:
+                                    if (proto == RFCOMM_UUID) {
+                                        channel = d->val.uint8;
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                    sdp_list_free((sdp_list_t *)p->data, NULL);
+                }
+                sdp_list_free(proto_list, NULL);
+            }
+            sdp_record_free(rec);
+            if (channel) break;  // Bulundu
+        }
+        sdp_list_free(response_list, NULL);
+    }
+    
+    sdp_close(session);
+    
+    if (channel) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "✓ HFP-AG kanalı bulundu: %d", channel);
+        log_msg(msg);
+    }
+    
+    return channel;
+}
 
 // ============================================================================
 // CSV DATABASE
@@ -405,6 +539,74 @@ static const char *lookup_contact_name(const char *number) {
         if (strcmp(contacts[i].number, number) == 0) return contacts[i].name;
     }
     return NULL;
+}
+
+// ============================================================================
+// SETTINGS JSON
+// ============================================================================
+
+static void load_settings(void) {
+    FILE *f = fopen(SETTINGS_JSON, "r");
+    if (!f) return;
+    
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int val;
+        if (sscanf(line, " \"col_recent_type\" : %d", &val) == 1) col_recent_type = val;
+        else if (sscanf(line, " \"col_recent_name\" : %d", &val) == 1) col_recent_name = val;
+        else if (sscanf(line, " \"col_recent_number\" : %d", &val) == 1) col_recent_number = val;
+        else if (sscanf(line, " \"col_recent_time\" : %d", &val) == 1) col_recent_time = val;
+        else if (sscanf(line, " \"col_contacts_name\" : %d", &val) == 1) col_contacts_name = val;
+        else if (sscanf(line, " \"col_contacts_number\" : %d", &val) == 1) col_contacts_number = val;
+    }
+    fclose(f);
+}
+
+static void save_settings(void) {
+    FILE *f = fopen(SETTINGS_JSON, "w");
+    if (!f) return;
+    
+    fprintf(f, "{\n");
+    fprintf(f, "  \"col_recent_type\": %d,\n", col_recent_type);
+    fprintf(f, "  \"col_recent_name\": %d,\n", col_recent_name);
+    fprintf(f, "  \"col_recent_number\": %d,\n", col_recent_number);
+    fprintf(f, "  \"col_recent_time\": %d,\n", col_recent_time);
+    fprintf(f, "  \"col_contacts_name\": %d,\n", col_contacts_name);
+    fprintf(f, "  \"col_contacts_number\": %d\n", col_contacts_number);
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
+// GTK destroy callback wrapper
+static void on_window_destroy(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data;
+    save_settings();
+}
+
+// Sütun genişlik değişim callback'leri
+static void on_col_recent_type_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_recent_type = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
+}
+static void on_col_recent_name_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_recent_name = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
+}
+static void on_col_recent_number_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_recent_number = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
+}
+static void on_col_recent_time_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_recent_time = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
+}
+static void on_col_contacts_name_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_contacts_name = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
+}
+static void on_col_contacts_number_width(GObject *obj, GParamSpec *pspec, gpointer data) {
+    (void)pspec; (void)data;
+    col_contacts_number = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
 }
 
 static void refresh_contacts_view(void) {
@@ -659,6 +861,7 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
     char name[128] = {0};
     char number[64] = {0};
     char datetime[64] = {0};
+    char raw_datetime[20] = {0};
 
     while (fgets(line, sizeof(line), f)) {
         if (g_str_has_prefix(line, "FN:")) {
@@ -672,10 +875,33 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
                 char *nl = strchr(number, '\n'); if (nl) *nl = '\0';
                 char *cr = strchr(number, '\r'); if (cr) *cr = '\0';
             }
-        } else if (g_str_has_prefix(line, "X-IRMC-CALL-DATETIME:")) {
-            strncpy(datetime, line + strlen("X-IRMC-CALL-DATETIME:"), sizeof(datetime) - 1);
-            char *nl = strchr(datetime, '\n'); if (nl) *nl = '\0';
-            char *cr = strchr(datetime, '\r'); if (cr) *cr = '\0';
+        } else if (g_str_has_prefix(line, "X-IRMC-CALL-DATETIME")) {
+            // Format: X-IRMC-CALL-DATETIME;RECEIVED:20260120T031500 veya sadece :20260120T031500
+            char *value = strchr(line, ':');
+            if (value) {
+                value++;  // ':' karakterini atla
+                // Zaman damgasını formatla: 20260120T031500 -> 20.01.2026 03:15
+                char raw[32] = {0};
+                strncpy(raw, value, sizeof(raw) - 1);
+                char *nl = strchr(raw, '\n'); if (nl) *nl = '\0';
+                char *cr = strchr(raw, '\r'); if (cr) *cr = '\0';
+                
+                // Raw formatı sakla (sıralama için)
+                strncpy(raw_datetime, raw, sizeof(raw_datetime) - 1);
+                
+                if (strlen(raw) >= 15) {  // 20260120T031500
+                    char year[5] = {0}, month[3] = {0}, day[3] = {0};
+                    char hour[3] = {0}, min[3] = {0};
+                    strncpy(year, raw, 4);
+                    strncpy(month, raw + 4, 2);
+                    strncpy(day, raw + 6, 2);
+                    strncpy(hour, raw + 9, 2);
+                    strncpy(min, raw + 11, 2);
+                    snprintf(datetime, sizeof(datetime), "%s.%s.%s %s:%s", day, month, year, hour, min);
+                } else if (strlen(raw) > 0) {
+                    strncpy(datetime, raw, sizeof(datetime) - 1);
+                }
+            }
         } else if (g_str_has_prefix(line, "END:VCARD")) {
             if (number[0]) {
                 if (recent_count < (int)(sizeof(recent_entries) / sizeof(recent_entries[0]))) {
@@ -684,11 +910,13 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
                     strncpy(entry->name, name[0] ? name : "-", sizeof(entry->name) - 1);
                     strncpy(entry->number, number, sizeof(entry->number) - 1);
                     strncpy(entry->time, datetime[0] ? datetime : "-", sizeof(entry->time) - 1);
+                    strncpy(entry->raw_time, raw_datetime, sizeof(entry->raw_time) - 1);
                 }
             }
             memset(name, 0, sizeof(name));
             memset(number, 0, sizeof(number));
             memset(datetime, 0, sizeof(datetime));
+            memset(raw_datetime, 0, sizeof(raw_datetime));
         }
     }
 
@@ -1355,7 +1583,7 @@ static gpointer sync_recents_thread(gpointer data) {
     gboolean any_success = FALSE;
     
     const char *phonebooks[] = {"ich", "och", "mch"};
-    const char *types[] = {"Gelen", "Giden", "Cevapsız"};
+    const char *types[] = {"📥 Gelen", "📤 Giden", "❌ Cevapsız"};
     
     // TEK session oluştur - tüm phonebook'lar için
     GError *error = NULL;
@@ -1433,11 +1661,11 @@ static gpointer sync_recents_thread(gpointer data) {
             }
         }
         
-        // PullAll - son 50 kayıt
+        // PullAll - son 33 kayıt (3 kategori x 33 = ~100 toplam)
         GVariantBuilder pull_opts;
         g_variant_builder_init(&pull_opts, G_VARIANT_TYPE_VARDICT);
         g_variant_builder_add(&pull_opts, "{sv}", "Format", g_variant_new_string("vcard21"));
-        g_variant_builder_add(&pull_opts, "{sv}", "MaxListCount", g_variant_new_uint16(15));
+        g_variant_builder_add(&pull_opts, "{sv}", "MaxListCount", g_variant_new_uint16(33));
         
         error = NULL;
         result = g_dbus_connection_call_sync(
@@ -1518,6 +1746,16 @@ static gpointer sync_recents_thread(gpointer data) {
         }
     }
     
+    // Tüm kayıtları zamana göre sırala (en yeniden en eskiye)
+    if (recent_count > 1) {
+        qsort(recent_entries, recent_count, sizeof(RecentEntry), compare_recents);
+    }
+    
+    // Son 100 kayıtla sınırla
+    if (recent_count > 100) {
+        recent_count = 100;
+    }
+    
     // Session'ı kapat (döngü bittikten sonra)
     if (session_copy && session_copy[0]) {
         g_dbus_connection_call_sync(
@@ -1580,6 +1818,54 @@ static gboolean hfp_update_call_state_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+static void handle_ciev_event(int ind, int val) {
+    if (ind == 1) {  // Call indicator
+        if (val == 1) {
+            log_msg("✓ Arama aktif");
+            if (!sco_audio_running && sco_socket < 0) {
+                sco_connect();
+            }
+            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_ACTIVE));
+        } else if (val == 0) {
+            if (current_call_state != CALL_IDLE) {
+                log_msg("📱 Arama sonlandı");
+                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
+            }
+        }
+        return;
+    }
+
+    if (ind == 2) {  // Call setup indicator
+        if (val == 0) {
+            if (current_call_state == CALL_OUTGOING || current_call_state == CALL_RINGING) {
+                log_msg("✓ Arama kurulumu tamamlandı (setup=0)");
+            }
+            // Setup bitti ama aktif arama yoksa UI'ı temizle
+            if (current_call_state != CALL_ACTIVE) {
+                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
+            }
+            return;
+        }
+        if (val == 1) {
+            if (current_call_state != CALL_RINGING) {
+                log_msg("🔔 GELEN ARAMA (CIEV)");
+                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_RINGING));
+            }
+            return;
+        }
+        if (val == 2 || val == 3) {
+            if (current_call_state != CALL_OUTGOING) {
+                log_msg("📱 Giden arama (CIEV)");
+                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_OUTGOING));
+            }
+            if (!sco_audio_running && sco_socket < 0) {
+                sco_connect();
+            }
+            return;
+        }
+    }
+}
+
 static gpointer hfp_monitor_thread(gpointer data) {
     (void)data;
     char buf[512];
@@ -1629,28 +1915,7 @@ static gpointer hfp_monitor_thread(gpointer data) {
             if (strstr(buf, "+CIEV")) {
                 int ind = -1, val = -1;
                 if (parse_ciev(buf, &ind, &val)) {
-                    if (ind == 1) {
-                        if (val == 1) {
-                            log_msg("✓ Arama aktif");
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_ACTIVE));
-                        } else if (val == 0) {
-                            log_msg("📱 Arama sonlandı");
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
-                            break;
-                        }
-                    } else if (ind == 2) {
-                        if (val == 0) {
-                            log_msg("📱 Arama sonlandı");
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
-                            break;
-                        } else if (val == 1) {
-                            log_msg("🔔 Gelen arama (CIEV)");
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_RINGING));
-                        } else if (val == 2 || val == 3) {
-                            log_msg("📱 Giden arama (CIEV)");
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_OUTGOING));
-                        }
-                    }
+                    handle_ciev_event(ind, val);
                 }
             } else if (strstr(buf, "NO CARRIER") || strstr(buf, "BUSY") || strstr(buf, "NO ANSWER")) {
                 log_msg("📱 Arama sonlandı");
@@ -1764,7 +2029,7 @@ static gpointer incoming_call_listener(gpointer data) {
     
     struct sockaddr_rc addr = {0};
     addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = 3;  // HFP AG kanalı
+    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dinamik veya varsayılan
     str2ba(device_addr, &addr.rc_bdaddr);
     
     if (connect(hfp_listen_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1812,6 +2077,10 @@ static gpointer incoming_call_listener(gpointer data) {
     
     // Olayları dinle
     while (incoming_call_running && hfp_listen_socket >= 0) {
+        if (hfp_listen_paused) {
+            usleep(100000);
+            continue;
+        }
         fd_set readfds;
         struct timeval tv;
         FD_ZERO(&readfds);
@@ -1822,6 +2091,10 @@ static gpointer incoming_call_listener(gpointer data) {
         int ret = select(hfp_listen_socket + 1, &readfds, NULL, NULL, &tv);
         
         if (!incoming_call_running) break;
+
+        if (hfp_listen_paused) {
+            continue;
+        }
         
         if (ret > 0 && FD_ISSET(hfp_listen_socket, &readfds)) {
             memset(buf, 0, sizeof(buf));
@@ -1929,36 +2202,7 @@ static gpointer incoming_call_listener(gpointer data) {
             if (strstr(buf, "+CIEV:")) {
                 int ind = -1, val = -1;
                 if (parse_ciev(buf, &ind, &val)) {
-                    if (ind == 1) {
-                        if (val == 1) {
-                            log_msg("✓ Arama aktif");
-                            // SCO bağlantısı kur
-                            sco_connect();
-                            g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_ACTIVE));
-                        } else if (val == 0) {
-                            if (current_call_state != CALL_IDLE) {
-                                log_msg("📱 Arama sonlandı");
-                                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
-                            }
-                        }
-                    } else if (ind == 2) {
-                        if (val == 0) {
-                            if (current_call_state != CALL_IDLE) {
-                                log_msg("📱 Arama sonlandı");
-                                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
-                            }
-                        } else if (val == 1) {
-                            if (current_call_state != CALL_RINGING) {
-                                log_msg("🔔 GELEN ARAMA (CIEV)");
-                                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_RINGING));
-                            }
-                        } else if (val == 2 || val == 3) {
-                            if (current_call_state != CALL_OUTGOING) {
-                                log_msg("📱 Giden arama (CIEV)");
-                                g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_OUTGOING));
-                            }
-                        }
-                    }
+                    handle_ciev_event(ind, val);
                 }
             }
             else if (strstr(buf, "NO CARRIER") || strstr(buf, "BUSY") || strstr(buf, "NO ANSWER") || strstr(buf, "ERROR")) {
@@ -2005,6 +2249,85 @@ static void stop_incoming_call_listener(void) {
     }
 }
 
+static void aec_fifo_clear(void) {
+    pthread_mutex_lock(&aec_fifo_mutex);
+    aec_fifo_head = 0;
+    aec_fifo_tail = 0;
+    aec_fifo_size = 0;
+    pthread_mutex_unlock(&aec_fifo_mutex);
+}
+
+static void aec_fifo_push(const int16_t *samples, int count) {
+    if (count <= 0) return;
+    pthread_mutex_lock(&aec_fifo_mutex);
+    for (int i = 0; i < count; i++) {
+        aec_render_fifo[aec_fifo_head] = samples[i];
+        aec_fifo_head = (aec_fifo_head + 1) % AEC_FIFO_CAPACITY;
+        if (aec_fifo_size < AEC_FIFO_CAPACITY) {
+            aec_fifo_size++;
+        } else {
+            aec_fifo_tail = (aec_fifo_tail + 1) % AEC_FIFO_CAPACITY;
+        }
+    }
+    pthread_mutex_unlock(&aec_fifo_mutex);
+}
+
+static gboolean aec_fifo_pop(int16_t *out, int count) {
+    if (count <= 0) return FALSE;
+    gboolean ok = FALSE;
+    pthread_mutex_lock(&aec_fifo_mutex);
+    if (aec_fifo_size >= count) {
+        for (int i = 0; i < count; i++) {
+            out[i] = aec_render_fifo[aec_fifo_tail];
+            aec_fifo_tail = (aec_fifo_tail + 1) % AEC_FIFO_CAPACITY;
+        }
+        aec_fifo_size -= count;
+        ok = TRUE;
+    }
+    pthread_mutex_unlock(&aec_fifo_mutex);
+    return ok;
+}
+
+static void init_webrtc_aec(void) {
+#ifdef HAVE_WEBRTC_APM
+    if (aec_force_disable) {
+        aec_enabled = FALSE;
+        aec_fifo_clear();
+        log_msg("⚠️ WebRTC AEC kapalı (robotik ses önleme)");
+        return;
+    }
+    pthread_mutex_lock(&aec_mutex);
+    if (!aec_handle) {
+        aec_handle = aec_create(8000);
+        aec_enabled = (aec_handle != NULL);
+    } else {
+        aec_enabled = TRUE;
+    }
+    pthread_mutex_unlock(&aec_mutex);
+#else
+    aec_enabled = FALSE;
+#endif
+    if (aec_enabled) {
+        log_msg("✅ WebRTC AEC aktif");
+    } else {
+        log_msg("⚠️ WebRTC AEC devre dışı");
+    }
+    aec_fifo_clear();
+}
+
+static void shutdown_webrtc_aec(void) {
+#ifdef HAVE_WEBRTC_APM
+    pthread_mutex_lock(&aec_mutex);
+    if (aec_handle) {
+        aec_destroy(aec_handle);
+        aec_handle = NULL;
+    }
+    pthread_mutex_unlock(&aec_mutex);
+#endif
+    aec_enabled = FALSE;
+    aec_fifo_clear();
+}
+
 // SCO -> PulseAudio playback thread (telefon sesini PC'ye)
 static void* sco_playback_thread_func(void *data) {
     (void)data;
@@ -2046,6 +2369,12 @@ static void* sco_playback_thread_func(void *data) {
                 g_idle_add((GSourceFunc)lambda_log, g_strdup("⚠️ Telefon sesi kesildi"));
             }
             break;
+        }
+
+        if (aec_enabled) {
+            int16_t *samples = (int16_t *)buf;
+            int count = (int)(bytes_read / 2);
+            aec_fifo_push(samples, count);
         }
         
         if (pa_simple_write(pulse_playback, buf, bytes_read, &err) < 0) {
@@ -2095,29 +2424,57 @@ static void* sco_capture_thread_func(void *data) {
     
     g_idle_add((GSourceFunc)lambda_log, g_strdup("🎤 Mikrofon aktif - sesiniz telefona gidiyor"));
     
-    unsigned char buf[48];  // SCO paket boyutu küçültüldü
+    const int mtu = sco_mtu;  // Dinamik MTU
+    unsigned char buf[AEC_FRAME_BYTES];
+    int16_t render_frame[AEC_FRAME_SAMPLES];
+    int send_error_logged = 0;
     
     while (sco_audio_running && sco_socket >= 0) {
+        int read_bytes = aec_enabled ? AEC_FRAME_BYTES : mtu;
+
         // Mikrofondan oku
-        if (pa_simple_read(pulse_capture, buf, sizeof(buf), &err) < 0) {
+        if (pa_simple_read(pulse_capture, buf, read_bytes, &err) < 0) {
             if (sco_audio_running) {
                 g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon okuma hatası: %s", pa_strerror(err)));
             }
             break;
         }
+
+        if (aec_enabled) {
+            int16_t *near = (int16_t *)buf;
+            if (!aec_fifo_pop(render_frame, AEC_FRAME_SAMPLES)) {
+                memset(render_frame, 0, sizeof(render_frame));
+            }
+#ifdef HAVE_WEBRTC_APM
+            pthread_mutex_lock(&aec_mutex);
+            if (aec_handle) {
+                aec_process(aec_handle, near, render_frame, AEC_FRAME_SAMPLES);
+            }
+            pthread_mutex_unlock(&aec_mutex);
+#endif
+        }
         
-        // SCO'ya gönder - MSG_NOSIGNAL ile sinyal engelleme
-        ssize_t sent = send(sco_socket, buf, sizeof(buf), MSG_NOSIGNAL);
-        if (sent <= 0) {
-            if (sco_audio_running && errno != EAGAIN && errno != EWOULDBLOCK) {
-                g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon gönderme hatası: %s", strerror(errno)));
+        // SCO'ya gönder - MTU boyutunda parçalara böl
+        for (int offset = 0; offset < read_bytes; offset += mtu) {
+            int chunk = read_bytes - offset;
+            if (chunk > mtu) chunk = mtu;
+            ssize_t sent = send(sco_socket, buf + offset, chunk, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                if (errno == EPIPE || errno == ENOTCONN || errno == ECONNRESET) {
+                    if (!send_error_logged) {
+                        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon gönderme hatası: %s", strerror(errno)));
+                        send_error_logged = 1;
+                    }
+                    stop_sco_audio("🔇 SCO kapatıldı (karşı uç kapattı)");
+                    return NULL;
+                }
+                if (sco_audio_running && errno != EAGAIN && errno != EWOULDBLOCK && !send_error_logged) {
+                    g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon gönderme hatası: %s", strerror(errno)));
+                    send_error_logged = 1;
+                }
+                usleep(1000);  // Kısa bekle ve tekrar dene
+                continue;
             }
-            // Hata olsa bile devam et - bağlantı kopana kadar
-            if (errno == EPIPE || errno == ENOTCONN || errno == ECONNRESET) {
-                break;
-            }
-            usleep(1000);  // Kısa bekle ve tekrar dene
-            continue;
         }
     }
     
@@ -2134,6 +2491,21 @@ static void* sco_capture_thread_func(void *data) {
 static gboolean sco_connect(void) {
     if (!device_addr[0]) {
         return FALSE;
+    }
+
+    // Önceki bağlantı hala açıksa bekle
+    if (sco_audio_running) {
+        log_msg("ℹ️ Önceki SCO kapatılıyor...");
+        stop_sco_audio(NULL);
+        usleep(100000);  // 100ms ekstra bekle
+    }
+
+    if (sco_socket >= 0) {
+        // Socket açık ama thread yok - temizle
+        shutdown(sco_socket, SHUT_RDWR);
+        close(sco_socket);
+        sco_socket = -1;
+        usleep(50000);
     }
     
     // SCO socket oluştur
@@ -2169,6 +2541,21 @@ static gboolean sco_connect(void) {
     }
     
     log_msg("✓ SCO audio bağlandı");
+
+    // SCO MTU'yu dinamik oku
+    struct sco_options sco_opts;
+    socklen_t optlen = sizeof(sco_opts);
+    if (getsockopt(sco_socket, SOL_SCO, SCO_OPTIONS, &sco_opts, &optlen) == 0) {
+        sco_mtu = sco_opts.mtu;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ℹ️ SCO MTU: %d byte", sco_mtu);
+        log_msg(msg);
+    } else {
+        sco_mtu = 48;  // Varsayılan
+        log_msg("ℹ️ SCO MTU okunamadı, varsayılan: 48");
+    }
+
+    init_webrtc_aec();
     
     // Playback thread'i başlat (telefon -> PC hoparlör)
     sco_audio_running = TRUE;
@@ -2216,6 +2603,9 @@ static gboolean hfp_dial(const char *number) {
     // Dinleyici soketi varsa onu kullan
     if (hfp_listen_socket >= 0) {
         log_msg("📱 Mevcut HFP bağlantısı kullanılıyor...");
+
+        hfp_listen_paused = TRUE;
+        usleep(150000);
         
         // Aramayı başlat
         char cmd[128];
@@ -2224,6 +2614,7 @@ static gboolean hfp_dial(const char *number) {
         snprintf(cmd, sizeof(cmd), "ATD%s;\r", number);
         if (write(hfp_listen_socket, cmd, strlen(cmd)) <= 0) {
             log_msg("⚠️ Arama komutu gönderilemedi");
+            hfp_listen_paused = FALSE;
             return FALSE;
         }
         
@@ -2246,15 +2637,18 @@ static gboolean hfp_dial(const char *number) {
             sco_connect();
             
             set_call_state(CALL_OUTGOING);
+            hfp_listen_paused = FALSE;
             return TRUE;
         } else if (strstr(buf, "ERROR") || strstr(buf, "NO CARRIER")) {
             log_msg("⚠️ Telefon aramayı reddetti");
+            hfp_listen_paused = FALSE;
             return FALSE;
         } else {
             log_msg("⚠️ Bilinmeyen yanıt, yine de deneniyor...");
             // Bilinmeyen yanıtta da dene
             sco_connect();
             set_call_state(CALL_OUTGOING);
+            hfp_listen_paused = FALSE;
             return TRUE;
         }
     }
@@ -2272,7 +2666,7 @@ static gboolean hfp_dial(const char *number) {
     // Bağlantı adresi
     struct sockaddr_rc addr = {0};
     addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = 3;  // HFP AG kanalı (sdptool ile bulundu)
+    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dinamik veya varsayılan
     str2ba(device_addr, &addr.rc_bdaddr);
     
     // Bağlan
@@ -2479,6 +2873,106 @@ static void on_recent_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
     }
 }
 
+// Sağ tık menüsünden numarayı kopyala
+static void on_copy_number_activate(GtkMenuItem *menuitem, gpointer data) {
+    (void)menuitem;
+    const char *number = (const char *)data;
+    if (number && *number) {
+        GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+        gtk_clipboard_set_text(clipboard, number, -1);
+        log_msg("📋 Numara kopyalandı");
+    }
+}
+
+// Rehber sağ tık menüsü
+static gboolean on_recents_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    (void)data;
+    
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Sağ tık
+        GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
+        GtkTreePath *path = NULL;
+        
+        // Tıklanan satırı bul
+        if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y,
+                                          &path, NULL, NULL, NULL)) {
+            // Satırı seç
+            GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+            gtk_tree_selection_select_path(selection, path);
+            
+            GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+            GtkTreeIter iter;
+            
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                static gchar copied_number[64];
+                gchar *number = NULL;
+                gtk_tree_model_get(model, &iter, 2, &number, -1);  // Sütun 2: Numara
+                
+                if (number && *number) {
+                    strncpy(copied_number, number, sizeof(copied_number) - 1);
+                    copied_number[sizeof(copied_number) - 1] = '\0';
+                    g_free(number);
+                    
+                    // Popup menü oluştur
+                    GtkWidget *menu = gtk_menu_new();
+                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Numarayı Kopyala");
+                    g_signal_connect(copy_item, "activate", G_CALLBACK(on_copy_number_activate), copied_number);
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy_item);
+                    gtk_widget_show_all(menu);
+                    
+                    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+                }
+            }
+            gtk_tree_path_free(path);
+        }
+        return TRUE;  // Event işlendi
+    }
+    return FALSE;
+}
+
+static gboolean on_contacts_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    (void)data;
+    
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Sağ tık
+        GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
+        GtkTreePath *path = NULL;
+        
+        // Tıklanan satırı bul
+        if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y,
+                                          &path, NULL, NULL, NULL)) {
+            // Satırı seç
+            GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+            gtk_tree_selection_select_path(selection, path);
+            
+            GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+            GtkTreeIter iter;
+            
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                static gchar copied_number[64];
+                gchar *number = NULL;
+                gtk_tree_model_get(model, &iter, 1, &number, -1);
+                
+                if (number && *number) {
+                    strncpy(copied_number, number, sizeof(copied_number) - 1);
+                    copied_number[sizeof(copied_number) - 1] = '\0';
+                    g_free(number);
+                    
+                    // Popup menü oluştur
+                    GtkWidget *menu = gtk_menu_new();
+                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Numarayı Kopyala");
+                    g_signal_connect(copy_item, "activate", G_CALLBACK(on_copy_number_activate), copied_number);
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy_item);
+                    gtk_widget_show_all(menu);
+                    
+                    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+                }
+            }
+            gtk_tree_path_free(path);
+        }
+        return TRUE;  // Event işlendi
+    }
+    return FALSE;
+}
+
 // Rehberde satıra çift tıklandığında
 static void on_contact_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
                                      GtkTreeViewColumn *column, gpointer data) {
@@ -2597,6 +3091,14 @@ static void set_state(AppState new_state) {
     
     // CONNECTED olduğunda arka planda veri yüklemeyi başlat
     if (new_state == STATE_CONNECTED && old_state != STATE_CONNECTED) {
+        // HFP kanalını SDP ile bul (henüz bulunmamışsa)
+        if (hfp_channel == 0 && device_addr[0]) {
+            uint8_t ch = find_hfp_channel(device_addr);
+            if (ch) {
+                hfp_channel = ch;
+            }
+        }
+        
         // Gelen arama dinleyiciyi başlat
         start_incoming_call_listener();
         
@@ -3017,16 +3519,30 @@ static gboolean parse_ciev(const char *buf, int *indicator, int *value) {
 static void stop_sco_audio(const char *reason) {
     gboolean was_running = sco_audio_running || (sco_socket >= 0);
 
+    // Önce flag'i kapat ki thread'ler döngüden çıksın
     sco_audio_running = FALSE;
+    
+    // Thread'lerin döngüden çıkması için kısa bekle
+    usleep(50000);  // 50ms
+    
+    // Socket'i kapat
     if (sco_socket >= 0) {
         shutdown(sco_socket, SHUT_RDWR);
         close(sco_socket);
         sco_socket = -1;
     }
+    
+    // Thread'lerin tamamen bitmesini bekle (max 500ms)
+    for (int i = 0; i < 10 && (pulse_playback || pulse_capture); i++) {
+        usleep(50000);  // 50ms
+    }
 
     if (reason && was_running) {
-        log_msg(reason);
+        // Thread-safe log (arka plan thread'inden çağrılabilir)
+        g_idle_add((GSourceFunc)lambda_log, g_strdup(reason));
     }
+
+    shutdown_webrtc_aec();
 }
 
 static void clear_device_info(void) {
@@ -3034,6 +3550,7 @@ static void clear_device_info(void) {
     device_addr[0] = '\0';
     device_name[0] = '\0';
     device_paired = FALSE;
+    hfp_channel = 0;  // HFP kanalını sıfırla
 }
 
 static void cleanup_connection(const char *reason, gboolean clear_device) {
@@ -3057,34 +3574,43 @@ static void handle_incoming_call(const char *number) {
 
     strncpy(current_call_number, number, sizeof(current_call_number) - 1);
     const char *name = lookup_contact_name(number);
-    if (name) {
+    current_call_name[0] = '\0';
+    if (name && *name) {
         strncpy(current_call_name, name, sizeof(current_call_name) - 1);
-    } else {
-        memset(current_call_name, 0, sizeof(current_call_name));
     }
 
     log_msg("📞 Gelen arama algılandı");
     set_call_state(CALL_RINGING);
+    update_ui();
 }
 
 static void on_answer_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
+
     log_msg("✅ Arama cevaplandı");
-    
-    // Gelen arama için HFP ile cevapla
+
+    if (current_call_state != CALL_RINGING) {
+        log_msg("⚠️ Cevapla: Geçersiz durumda");
+        return;
+    }
+
+    gtk_widget_set_sensitive(answer_btn, FALSE);
+    gtk_widget_set_sensitive(reject_btn, FALSE);
+
     if (hfp_listen_socket >= 0) {
         char cmd[] = "ATA\r";
         if (write(hfp_listen_socket, cmd, strlen(cmd)) > 0) {
             usleep(200000);
             char buf[256] = {0};
             read(hfp_listen_socket, buf, sizeof(buf) - 1);
-            
-            // SCO bağlantısı kur
-            sco_connect();
         }
     }
-    
+
+    // SCO bağlantısı kur
+    sco_connect();
+
     set_call_state(CALL_ACTIVE);
+    update_ui();
 }
 
 static void on_reject_clicked(GtkWidget *widget, gpointer data) {
@@ -3150,35 +3676,25 @@ static void on_hangup_clicked(GtkWidget *widget, gpointer data) {
 
     gtk_widget_set_sensitive(reject_btn, FALSE);
     gtk_widget_set_sensitive(hangup_btn, FALSE);
-    
-    // SCO'yu kapat
+
+    // SCO'yu arka planda kapat (UI donmasın)
     sco_audio_running = FALSE;
-    if (sco_socket >= 0) {
-        shutdown(sco_socket, SHUT_RDWR);
-        close(sco_socket);
-        sco_socket = -1;
-        log_msg("🔊 SCO kapatıldı");
-    }
     
     // Gelen arama görüşmesi (listen socket üzerinden)
     if (hfp_listen_socket >= 0) {
         char cmd[] = "AT+CHUP\r";
-        ssize_t written = write(hfp_listen_socket, cmd, strlen(cmd));
-        if (written > 0) {
-            usleep(300000);
-            char buf[256] = {0};
-            read(hfp_listen_socket, buf, sizeof(buf) - 1);
-            log_msg("📱 AT+CHUP gönderildi (listen)");
-        } else {
-            log_msg("⚠️ AT+CHUP gönderilemedi");
-        }
-        // NOT: listen socket'i kapatma - listener thread aktif
+        write(hfp_listen_socket, cmd, strlen(cmd));
+        log_msg("📱 AT+CHUP gönderildi (listen)");
     }
-    // Giden arama (hfp_socket üzerinden) - gelen arama yoksa
+    // Giden arama (hfp_socket üzerinden)
     else if (hfp_socket >= 0) {
-        hfp_hangup();
-        return;  // hfp_hangup zaten state'i ayarlar
+        char cmd[] = "AT+CHUP\r";
+        write(hfp_socket, cmd, strlen(cmd));
+        log_msg("📱 AT+CHUP gönderildi");
     }
+    
+    // SCO temizliğini arka planda yap
+    g_thread_new("hangup_cleanup", (GThreadFunc)stop_sco_audio, "🔊 SCO kapatıldı");
     
     set_call_state(CALL_IDLE);
     clear_call_info();
@@ -3533,7 +4049,12 @@ static void apply_css(void) {
     GtkCssProvider *provider = gtk_css_provider_new();
 
     const char *css =
+        /* Global - HER ŞEY koyu */
+        "* { background-color: #161b22; color: #c9d1d9; }"
         "window { background: #0d1117; }"
+        "box { background: transparent; }"
+        "grid { background: transparent; }"
+        
         ".title { font-size: 18px; font-weight: bold; color: #58a6ff; }"
         ".status-idle { color: #8b949e; }"
         ".status-discoverable { color: #58a6ff; font-weight: bold; }"
@@ -3544,23 +4065,31 @@ static void apply_css(void) {
         ".status-error { color: #f85149; font-weight: bold; }"
         
         /* Labels - tüm yazılar açık renk */
-        "label { color: #c9d1d9; }"
+        "label { color: #c9d1d9; background: transparent; }"
         ".info-label { color: #8b949e; font-size: 12px; }"
         ".call-label { color: #ffffff; font-size: 14px; }"
         ".call-ringing { color: #ffa657; font-weight: bold; font-size: 16px; }"
         
         /* Notebook tabs */
-        "notebook { background: #161b22; }"
+        "notebook { background: #0d1117; }"
         "notebook header { background: #21262d; }"
+        "notebook header tabs { background: #21262d; }"
+        "notebook stack { background: #0d1117; }"
         "notebook tab { padding: 8px 16px; background: #21262d; color: #8b949e; border: none; }"
         "notebook tab:checked { background: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }"
         "notebook tab:hover { color: #c9d1d9; }"
         
+        /* Scrolled windows & viewport */
+        "scrolledwindow { background: #0d1117; }"
+        "scrolledwindow > viewport { background: #0d1117; }"
+        "viewport { background: #0d1117; }"
+        
         /* List views */
-        ".list-view { background: #161b22; color: #c9d1d9; }"
-        ".list-view:selected { background: #1f6feb; }"
-        "treeview { background: #161b22; color: #c9d1d9; }"
-        "treeview:selected { background: #1f6feb; }"
+        ".list-view { background: #0d1117; color: #c9d1d9; }"
+        ".list-view:selected { background: #238636; color: #ffffff; }"
+        "treeview { background: #0d1117; color: #c9d1d9; }"
+        "treeview:selected { background: #238636; color: #ffffff; }"
+        "treeview header { background: #21262d; }"
         "treeview header button { background: #21262d; color: #8b949e; border: none; padding: 8px; }"
         
         /* Buttons */
@@ -3606,6 +4135,7 @@ static void create_ui(void) {
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 650);
     gtk_container_set_border_width(GTK_CONTAINER(window), 12);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
 
     GtkWidget *main_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_add(GTK_CONTAINER(window), main_vbox);
@@ -3761,13 +4291,24 @@ static void create_ui(void) {
     GtkTreeViewColumn *type_col = gtk_tree_view_column_new_with_attributes(
         "Tür", recent_renderer, "text", 0, NULL);
     gtk_tree_view_column_set_min_width(type_col, 60);
+    gtk_tree_view_column_set_resizable(type_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(type_col, col_recent_type);
+    g_signal_connect(type_col, "notify::width", G_CALLBACK(on_col_recent_type_width), NULL);
     GtkTreeViewColumn *rname_col = gtk_tree_view_column_new_with_attributes(
         "Ad", recent_renderer, "text", 1, NULL);
-    gtk_tree_view_column_set_expand(rname_col, TRUE);
+    gtk_tree_view_column_set_resizable(rname_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(rname_col, col_recent_name);
+    g_signal_connect(rname_col, "notify::width", G_CALLBACK(on_col_recent_name_width), NULL);
     GtkTreeViewColumn *rnum_col = gtk_tree_view_column_new_with_attributes(
         "Numara", recent_renderer, "text", 2, NULL);
+    gtk_tree_view_column_set_resizable(rnum_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(rnum_col, col_recent_number);
+    g_signal_connect(rnum_col, "notify::width", G_CALLBACK(on_col_recent_number_width), NULL);
     GtkTreeViewColumn *rtime_col = gtk_tree_view_column_new_with_attributes(
         "Zaman", recent_renderer, "text", 3, NULL);
+    gtk_tree_view_column_set_resizable(rtime_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(rtime_col, col_recent_time);
+    g_signal_connect(rtime_col, "notify::width", G_CALLBACK(on_col_recent_time_width), NULL);
 
     gtk_tree_view_append_column(GTK_TREE_VIEW(recent_view), type_col);
     gtk_tree_view_append_column(GTK_TREE_VIEW(recent_view), rname_col);
@@ -3780,6 +4321,8 @@ static void create_ui(void) {
     
     // Çift tıklama ile arama
     g_signal_connect(recent_view, "row-activated", G_CALLBACK(on_recent_row_activated), NULL);
+    // Sağ tıklama ile menü
+    g_signal_connect(recent_view, "button-press-event", G_CALLBACK(on_recents_button_press), NULL);
 
     gtk_container_add(GTK_CONTAINER(recent_scroll), recent_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), recents_page, 
@@ -3825,9 +4368,14 @@ static void create_ui(void) {
     GtkCellRenderer *contacts_renderer = gtk_cell_renderer_text_new();
     GtkTreeViewColumn *name_col = gtk_tree_view_column_new_with_attributes(
         "Ad", contacts_renderer, "text", 0, NULL);
-    gtk_tree_view_column_set_expand(name_col, TRUE);
+    gtk_tree_view_column_set_resizable(name_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(name_col, col_contacts_name);
+    g_signal_connect(name_col, "notify::width", G_CALLBACK(on_col_contacts_name_width), NULL);
     GtkTreeViewColumn *num_col = gtk_tree_view_column_new_with_attributes(
         "Numara", contacts_renderer, "text", 1, NULL);
+    gtk_tree_view_column_set_resizable(num_col, TRUE);
+    gtk_tree_view_column_set_fixed_width(num_col, col_contacts_number);
+    g_signal_connect(num_col, "notify::width", G_CALLBACK(on_col_contacts_number_width), NULL);
 
     gtk_tree_view_append_column(GTK_TREE_VIEW(contacts_view), name_col);
     gtk_tree_view_append_column(GTK_TREE_VIEW(contacts_view), num_col);
@@ -3838,6 +4386,8 @@ static void create_ui(void) {
     
     // Çift tıklama ile arama
     g_signal_connect(contacts_view, "row-activated", G_CALLBACK(on_contact_row_activated), NULL);
+    // Sağ tıklama ile menü
+    g_signal_connect(contacts_view, "button-press-event", G_CALLBACK(on_contacts_button_press), NULL);
 
     gtk_container_add(GTK_CONTAINER(contacts_scroll), contacts_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), contacts_page, 
@@ -3872,6 +4422,7 @@ static void create_ui(void) {
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
+    load_settings();  // Sütun genişliklerini yükle
     apply_css();
     create_ui();
 
