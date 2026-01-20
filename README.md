@@ -14,67 +14,101 @@ PC'nizi Bluetooth kulaklık gibi gösteren GTK3 tabanlı uygulama. Telefon bağl
 
 ## 📋 Gereksinimler
 
-- Linux (BlueZ)
-- Bluetooth adaptörü
-- bluez
-- bluez-obexd
-- libbluetooth-dev
-- libdbus-1-dev
-- libgtk-3-dev
-- pkg-config
+- Linux (Ubuntu 20.04+, Fedora, Arch)
+- Bluetooth adaptörü (USB veya dahili)
+- PulseAudio veya PipeWire
 
-## 🔧 Kurulum
+## 🚀 Tek Tıkla Kurulum ve Çalıştırma
 
-### Hızlı Kurulum (Tek Komut)
 ```bash
 ./scripts/run.sh
 ```
 
-### Manuel Kurulum
+Bu komut otomatik olarak:
+- ✅ Gerekli paketleri kurar
+- ✅ Bluetooth ayarlarını yapılandırır
+- ✅ main.conf'u düzenler (yedek alır)
+- ✅ Kullanıcıyı bluetooth grubuna ekler
+- ✅ Programı derler
+- ✅ Capability ekler
+- ✅ Programı başlatır
+
+## 🗑️ Temiz Kaldırma
+
 ```bash
-make setup     # Bağımlılıkları kur
-make gui       # Derle
-make install   # Sisteme kur (sudo gerektirmez)
+make uninstall
+# veya
+./scripts/uninstall.sh
 ```
 
-## ▶️ Çalıştırma
+Bu komut:
+- ✅ Sistem binary'sini kaldırır
+- ✅ main.conf'u eski haline getirir
+- ✅ Bluetooth grup üyeliğini geri alır
+- ✅ Derleme dosyalarını temizler
+- ✅ (Opsiyonel) Kullanıcı verilerini siler
 
-```bash
-# Yerel çalıştırma (derleme sonrası capability ekle)
-sudo setcap 'cap_net_admin,cap_net_raw+eip' ./bt_headset_gui
-./bt_headset_gui
+## 📱 İlk Kullanım
 
-# Veya sistem kurulumu sonrası
-bt_headset_gui
-```
+1. `./scripts/run.sh` çalıştırın
+2. Telefonunuzun Bluetooth ayarlarından PC'yi bulun
+3. Eşleştirin ve "Handsfree" olarak bağlayın
+4. Programda "Başlat" butonuna basın
 
-**Not:** Artık `sudo` gerekmez! Capability ile çalışır.
+**Not:** İlk kurulumdan sonra oturumu kapatıp açmanız gerekebilir (bluetooth grubu için).
 
-## 📱 Kullanım Akışı
-
-1. Başlat → PC keşfedilebilir olur
-2. Telefon Bluetooth ayarlarından PC'ye bağlanır
-3. Rehber ve son görüşmeler çekilir
-
-## 🔧 Makefile Komutları
+## 🔧 Manuel Komutlar
 
 | Komut | Açıklama |
 |-------|----------|
-| `make gui` | Derle |
-| `make setup` | Bağımlılıkları kur |
+| `make run` | Tek tıkla çalıştır |
+| `make gui` | Sadece derle |
+| `make setup` | Sadece kurulum yap |
 | `make install` | Sisteme kur (/usr/local/bin) |
-| `make uninstall` | Sistemden kaldır |
-| `make clean` | Temizle |
-| `make run` | Kur + derle + çalıştır |
+| `make uninstall` | Temiz kaldır (ayarları geri al) |
+| `make clean` | Derleme dosyalarını temizle |
 
 ## 🐛 Sorun Giderme
 
-- **obexd bulunamadı** → `./scripts/run.sh` tekrar çalıştırın
-- **Permission denied** → `sudo setcap 'cap_net_admin,cap_net_raw+eip' ./bt_headset_gui`
-- **Bluetooth servisi** → `sudo systemctl enable --now bluetooth`
+| Sorun | Çözüm |
+|-------|-------|
+| Permission denied | `newgrp bluetooth` veya oturumu yeniden aç |
+| Telefon bağlanmıyor | `bluetoothctl` ile discoverable on |
+| SCO bağlantısı başarısız | Telefonu yeniden eşleştirin |
+| Ses gelmiyor | PulseAudio Bluetooth modülünü kontrol edin |
+
+### Bluetooth Durumunu Kontrol Et
+```bash
+# Adaptör durumu
+hciconfig
+
+# Bağlı cihazlar
+bluetoothctl devices Connected
+
+# Servis durumu
+systemctl status bluetooth
+```
+
+## 📁 Dosya Yapısı
+
+```
+blue/
+├── bt_headset_gui.c       # Ana uygulama
+├── Makefile               # Derleme komutları
+├── scripts/
+│   ├── run.sh             # Tek tıkla çalıştır
+│   ├── setup.sh           # Kurulum (backup alır)
+│   └── uninstall.sh       # Kaldır (backup'tan geri yükler)
+├── .bt_headset_backup/    # Otomatik yedekler
+│   ├── main.conf.bak      # Orijinal Bluetooth ayarları
+│   └── changes.txt        # Yapılan değişiklikler
+├── settings.json          # Kullanıcı ayarları (sütun genişlikleri)
+├── contacts.csv           # Rehber önbelleği
+└── recents.csv            # Son aramalar önbelleği
+```
 
 ## 🔐 Güvenlik Notları
 
-⚠️ Uyarı: Bu program deneyseldir. Kritik aramalar için telefonunuzu doğrudan kullanın.
+⚠️ **Uyarı:** Bu program deneyseldir. Kritik aramalar için telefonunuzu doğrudan kullanın.
 
 

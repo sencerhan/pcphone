@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Bluetooth Headset
+GenericName=Bluetooth Phone
+Comment=Make phone calls through Bluetooth headset
+Exec=/usr/local/bin/bt_headset_gui %u
+Icon=call-start
+Terminal=false
+Type=Application
+Categories=Network;Telephony;
+MimeType=x-scheme-handler/tel;
+StartupNotify=true
+Keywords=bluetooth;phone;call;headset;tel;

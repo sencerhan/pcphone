@@ -1,10 +1,10 @@
 /*
- * Bluetooth Kulaklık Simülatörü - Pasif Mod
- * Telefon bağlanır, PC sadece kabul eder
- * Otomatik eşleşme + otomatik bağlanma
+ * Bluetooth Headset Simulator - Passive Mode
+ * Phone connects, PC just accepts
+ * Automatic pairing + automatic connection
  *
- * Derleme: make gui
- * Çalıştırma: sudo ./bt_headset_gui
+ * Build: make gui
+ * Run: sudo ./bt_headset_gui
  */
 
 #include <gtk/gtk.h>
@@ -30,7 +30,7 @@
 #include "audio_processing_wrapper.h"
 #endif
 
-// SCO voice ayarları (kernel'de tanımlı değilse)
+// SCO voice settings (if not defined in kernel)
 #ifndef BT_VOICE
 #define BT_VOICE 11
 struct bt_voice {
@@ -79,8 +79,8 @@ static CallState current_call_state = CALL_IDLE;
 static char current_call_number[64] = {0};
 static char current_call_name[128] = {0};
 static guint ringtone_timer_id = 0;
-static int hfp_socket = -1;  // HFP RFCOMM socket (arama sırasında açık kalır)
-static int hfp_listen_socket = -1;  // Gelen aramaları dinlemek için
+static int hfp_socket = -1;  // HFP RFCOMM socket (keeps open during call)
+static int hfp_listen_socket = -1;  // For listening to incoming calls
 static int sco_socket = -1;  // SCO audio socket
 static pthread_t sco_playback_thread;
 static pthread_t sco_capture_thread;
@@ -122,9 +122,12 @@ static gboolean device_paired = FALSE;
 
 static gboolean auto_connect_in_progress = FALSE;
 
-// Dinamik HFP kanal ve SCO MTU
-static uint8_t hfp_channel = 0;  // 0 = henüz bulunmadı
-static int sco_mtu = 48;  // Varsayılan, bağlantıda güncellenir
+// Dynamic HFP channel and SCO MTU
+static uint8_t hfp_channel = 0;  // 0 = not found yet
+static int sco_mtu = 48;  // Default, updated on connection
+
+// Pending dial from command line (tel: URI)
+static char pending_dial_number[64] = {0};
 
 // Contacts
 typedef struct {
@@ -140,17 +143,17 @@ typedef struct {
     char name[128];
     char number[64];
     char time[64];
-    char raw_time[20];  // Sıralama için: 20260120T031500
+    char raw_time[20];  // For sorting: 20260120T031500
 } RecentEntry;
 
 static RecentEntry recent_entries[500];
 static int recent_count = 0;
 
-// Son görüşmeleri zamana göre sırala (en yeniden en eskiye)
+// Sort recents by time (newest first)
 static int compare_recents(const void *a, const void *b) {
     const RecentEntry *ra = (const RecentEntry *)a;
     const RecentEntry *rb = (const RecentEntry *)b;
-    return strcmp(rb->raw_time, ra->raw_time);  // Azalan sıra (en yeni önce)
+    return strcmp(rb->raw_time, ra->raw_time);  // Descending order (newest first)
 }
 
 // UI
@@ -163,7 +166,6 @@ static GtkWidget *disconnect_btn;
 static GtkWidget *answer_btn;
 static GtkWidget *reject_btn;
 static GtkWidget *hangup_btn;
-static GtkWidget *test_call_btn;
 static GtkWidget *sync_recents_btn;
 static GtkWidget *contacts_spinner;
 static GtkWidget *recents_spinner;
@@ -183,17 +185,17 @@ static gboolean syncing_recents = FALSE;
 static gchar *pending_search_query = NULL;
 static guint search_timeout_id = 0;
 
-// Cached full phonebook (tüm rehber bir kez çekilir)
+// Cached full phonebook (pulled once)
 static Contact all_contacts[2000];
 static int all_contacts_count = 0;
 static gboolean phonebook_loaded = FALSE;
 
-// CSV dosya yolları
+// CSV file paths
 #define CONTACTS_CSV "contacts.csv"
 #define RECENTS_CSV "recents.csv"
 #define SETTINGS_JSON "settings.json"
 
-// Sütun genişlikleri (varsayılan değerler)
+// Column widths (default values)
 static int col_recent_type = 80;
 static int col_recent_name = 150;
 static int col_recent_number = 120;
@@ -217,20 +219,21 @@ static gpointer sync_recents_thread(gpointer data);
 static gpointer load_phonebook_thread(gpointer data);
 static void set_call_state(CallState new_state);
 static void log_msg(const char *msg);
+static void dial_number(const char *number);
 
 // ============================================================================
-// SDP - HFP KANAL BULMA
+// SDP - FIND HFP CHANNEL
 // ============================================================================
 
-// SDP sorgusu ile HFP-AG kanalını bul
+// Find HFP-AG channel via SDP query
 static uint8_t find_hfp_channel(const char *addr) {
     bdaddr_t target;
     str2ba(addr, &target);
     
-    // SDP session aç
+    // Open SDP session
     sdp_session_t *session = sdp_connect(BDADDR_ANY, &target, SDP_RETRY_IF_BUSY);
     if (!session) {
-        log_msg("ℹ️ SDP bağlantısı kurulamadı, varsayılan kanal kullanılacak");
+        log_msg("ℹ️ SDP connection failed, using default channel");
         return 0;
     }
     
@@ -238,14 +241,14 @@ static uint8_t find_hfp_channel(const char *addr) {
     uuid_t hfp_ag_uuid;
     sdp_uuid16_create(&hfp_ag_uuid, 0x111F);
     
-    // Arama listesi
+    // Search list
     sdp_list_t *search_list = sdp_list_append(NULL, &hfp_ag_uuid);
     
-    // İstenen özellikler
+    // Requested attributes
     uint32_t range = 0x0000ffff;
     sdp_list_t *attrid_list = sdp_list_append(NULL, &range);
     
-    // SDP sorgusu yap
+    // Perform SDP query
     sdp_list_t *response_list = NULL;
     int err = sdp_service_search_attr_req(session, search_list, SDP_ATTR_REQ_RANGE, attrid_list, &response_list);
     
@@ -287,7 +290,7 @@ static uint8_t find_hfp_channel(const char *addr) {
                 sdp_list_free(proto_list, NULL);
             }
             sdp_record_free(rec);
-            if (channel) break;  // Bulundu
+            if (channel) break;  // Found
         }
         sdp_list_free(response_list, NULL);
     }
@@ -296,7 +299,7 @@ static uint8_t find_hfp_channel(const char *addr) {
     
     if (channel) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "✓ HFP-AG kanalı bulundu: %d", channel);
+        snprintf(msg, sizeof(msg), "✓ HFP-AG channel found: %d", channel);
         log_msg(msg);
     }
     
@@ -312,7 +315,7 @@ static void save_contacts_to_csv(void) {
     if (!f) return;
     fprintf(f, "name,number\n");
     for (int i = 0; i < all_contacts_count; i++) {
-        // CSV escape - virgül ve tırnak için
+        // CSV escape - for commas and quotes
         fprintf(f, "\"%s\",\"%s\"\n", all_contacts[i].name, all_contacts[i].number);
     }
     fclose(f);
@@ -325,7 +328,7 @@ static gboolean load_contacts_from_csv(void) {
     char line[512];
     all_contacts_count = 0;
     
-    // Header'ı atla
+    // Skip header
     if (!fgets(line, sizeof(line), f)) {
         fclose(f);
         return FALSE;
@@ -372,7 +375,7 @@ static gboolean load_recents_from_csv(void) {
     char line[512];
     recent_count = 0;
     
-    // Header'ı atla
+    // Skip header
     if (!fgets(line, sizeof(line), f)) {
         fclose(f);
         return FALSE;
@@ -391,7 +394,7 @@ static gboolean load_recents_from_csv(void) {
                 *end = '\0';
                 p = end + 3;
             } else {
-                // Son alan
+                // Last field
                 char *quote = strchr(p, '"');
                 if (quote) *quote = '\0';
                 char *nl = strchr(p, '\n'); if (nl) *nl = '\0';
@@ -460,22 +463,22 @@ static gboolean disable_keep_above(gpointer data) {
 static void bring_window_to_front(void) {
     if (!window) return;
     
-    // Pencereyi görünür yap
+    // Make window visible
     gtk_widget_show(window);
     
-    // Minimize edilmişse geri getir
+    // Restore if minimized
     gtk_window_deiconify(GTK_WINDOW(window));
     
-    // Her zaman üstünde tut (geçici)
+    // Keep above temporarily
     gtk_window_set_keep_above(GTK_WINDOW(window), TRUE);
     
-    // Acil durum ipucu
+    // Urgency hint
     gtk_window_set_urgency_hint(GTK_WINDOW(window), TRUE);
     
-    // Pencereyi öne getir
+    // Bring to front
     gtk_window_present_with_time(GTK_WINDOW(window), GDK_CURRENT_TIME);
     
-    // Ses çal
+    // Play sound
     gdk_display_beep(gdk_display_get_default());
 }
 
@@ -510,7 +513,7 @@ static void add_contact(const char *name, const char *number) {
 static void load_contacts_from_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
-        log_msg("ℹ️ contacts.csv bulunamadı, kişi listesi boş");
+        log_msg("ℹ️ contacts.csv not found, contact list empty");
         return;
     }
 
@@ -561,6 +564,7 @@ static void load_settings(void) {
     }
     fclose(f);
 }
+
 
 static void save_settings(void) {
     FILE *f = fopen(SETTINGS_JSON, "w");
@@ -621,7 +625,6 @@ static void refresh_contacts_view(void) {
                           -1);
     }
 }
-
 static void refresh_recents_view(void) {
     if (!recent_store) return;
     gtk_list_store_clear(recent_store);
@@ -644,20 +647,20 @@ static void refresh_recents_view(void) {
 static gboolean ensure_obexd_running(void) {
     if (obex_conn) return TRUE;
 
-    log_msg("ℹ️ obexd servisi başlatılıyor...");
+    log_msg("ℹ️ Starting obexd service...");
 
     GError *error = NULL;
     gchar *addr = NULL;
     const gchar *sudo_user = NULL;
     const gchar *sudo_uid = NULL;
 
-    // Önce mevcut session bus'ı kontrol et
+    // Check existing session bus first
     const gchar *env_addr = g_getenv("DBUS_SESSION_BUS_ADDRESS");
     if (env_addr && *env_addr) {
         addr = g_strdup(env_addr);
-        log_msg("ℹ️ Mevcut session bus kullanılıyor");
+        log_msg("ℹ️ Using existing session bus");
     } else {
-        // Kullanıcının session bus'ını bul (sudo ile çalışırken)
+        // Find user's session bus (when running with sudo)
         uid_t real_uid = getuid();
         if (real_uid == 0) {
             sudo_user = g_getenv("SUDO_USER");
@@ -666,7 +669,7 @@ static gboolean ensure_obexd_running(void) {
                 gchar *bus_path = g_strdup_printf("/run/user/%s/bus", sudo_uid);
                 if (g_file_test(bus_path, G_FILE_TEST_EXISTS)) {
                     addr = g_strdup_printf("unix:path=%s", bus_path);
-                    log_msg("ℹ️ Kullanıcı session bus'ı bulundu");
+                    log_msg("ℹ️ Found user session bus");
                 }
                 g_free(bus_path);
             }
@@ -674,12 +677,12 @@ static gboolean ensure_obexd_running(void) {
     }
 
     if (!addr || !*addr) {
-        log_msg("⚠️ Session bus bulunamadı");
+        log_msg("⚠️ Session bus not found");
         g_free(addr);
         return FALSE;
     }
 
-    // Önce mevcut obexd'ye bağlanmayı dene
+    // Try to connect to existing obexd first
     error = NULL;
     obex_conn = g_dbus_connection_new_for_address_sync(
         addr,
@@ -687,7 +690,7 @@ static gboolean ensure_obexd_running(void) {
         NULL, NULL, &error);
 
     if (obex_conn) {
-        // obexd zaten çalışıyor mu kontrol et
+        // Check if obexd is already running
         GVariant *result = g_dbus_connection_call_sync(
             obex_conn,
             "org.bluez.obex",
@@ -703,7 +706,7 @@ static gboolean ensure_obexd_running(void) {
 
         if (result) {
             g_variant_unref(result);
-            log_msg("✓ Mevcut obexd servisi kullanılıyor");
+            log_msg("✓ Using existing obexd service");
             g_free(addr);
             return TRUE;
         }
@@ -715,22 +718,22 @@ static gboolean ensure_obexd_running(void) {
         error = NULL;
     }
 
-    // obexd çalışmıyor, kullanıcı olarak başlat
+    // obexd not running, start it as user
     gboolean started = FALSE;
     if (sudo_user && *sudo_user) {
-        // sudo -u <user> ile obexd başlat
+        // Start obexd with sudo -u <user>
         gchar *cmd = g_strdup_printf(
             "sudo -u %s DBUS_SESSION_BUS_ADDRESS='%s' /usr/libexec/bluetooth/obexd -n &",
             sudo_user, addr);
-        log_msg("ℹ️ obexd kullanıcı olarak başlatılıyor...");
+        log_msg("ℹ️ Starting obexd as user...");
         int ret = system(cmd);
         g_free(cmd);
         if (ret == 0) {
             started = TRUE;
-            usleep(500000); // 500ms bekle
+            usleep(500000); // 500ms wait
         }
     } else {
-        // Normal kullanıcı olarak çalışıyoruz
+        // Running as normal user
         const char *candidates[] = {
             "/usr/libexec/bluetooth/obexd",
             "/usr/lib/bluetooth/obexd",
@@ -757,16 +760,16 @@ static gboolean ensure_obexd_running(void) {
     }
 
     if (!started) {
-        log_msg("⚠️ obexd başlatılamadı");
+        log_msg("⚠️ Failed to start obexd");
         g_free(addr);
         return FALSE;
     }
 
-    // obexd'nin başlamasını bekle ve session bus'a bağlan
-    log_msg("ℹ️ obexd başlatıldı, bağlantı kuruluyor...");
+    // Wait for obexd to start and connect to session bus
+    log_msg("ℹ️ obexd started, establishing connection...");
     
     for (int retry = 0; retry < 10; retry++) {
-        usleep(300000); // 300ms bekle
+        usleep(300000); // 300ms wait
         
         error = NULL;
         obex_conn = g_dbus_connection_new_for_address_sync(
@@ -784,7 +787,7 @@ static gboolean ensure_obexd_running(void) {
             continue;
         }
 
-        // obexd servisinin hazır olup olmadığını kontrol et
+        // Check if obexd service is ready
         GVariant *result = g_dbus_connection_call_sync(
             obex_conn,
             "org.bluez.obex",
@@ -800,7 +803,7 @@ static gboolean ensure_obexd_running(void) {
 
         if (result) {
             g_variant_unref(result);
-            log_msg("✓ obexd bağlantısı kuruldu");
+            log_msg("✓ obexd connection established");
             g_free(addr);
             return TRUE;
         }
@@ -810,14 +813,14 @@ static gboolean ensure_obexd_running(void) {
     }
 
     g_free(addr);
-    log_msg("⚠️ obexd bağlantısı kurulamadı (timeout)");
+    log_msg("⚠️ Failed to establish obexd connection (timeout)");
     return FALSE;
 }
 
 static void parse_vcf_contacts(const char *file_path) {
     FILE *f = fopen(file_path, "r");
     if (!f) {
-        log_msg("⚠️ VCF dosyası açılamadı");
+        log_msg("⚠️ Failed to open VCF file");
         return;
     }
 
@@ -876,17 +879,17 @@ static void parse_vcf_recents(const char *file_path, const char *type_label) {
                 char *cr = strchr(number, '\r'); if (cr) *cr = '\0';
             }
         } else if (g_str_has_prefix(line, "X-IRMC-CALL-DATETIME")) {
-            // Format: X-IRMC-CALL-DATETIME;RECEIVED:20260120T031500 veya sadece :20260120T031500
+            // Format: X-IRMC-CALL-DATETIME;RECEIVED:20260120T031500 or just :20260120T031500
             char *value = strchr(line, ':');
             if (value) {
-                value++;  // ':' karakterini atla
-                // Zaman damgasını formatla: 20260120T031500 -> 20.01.2026 03:15
+                value++;  // Skip ':' character
+                // Format timestamp: 20260120T031500 -> 20.01.2026 03:15
                 char raw[32] = {0};
                 strncpy(raw, value, sizeof(raw) - 1);
                 char *nl = strchr(raw, '\n'); if (nl) *nl = '\0';
                 char *cr = strchr(raw, '\r'); if (cr) *cr = '\0';
                 
-                // Raw formatı sakla (sıralama için)
+                // Store raw format (for sorting)
                 strncpy(raw_datetime, raw, sizeof(raw_datetime) - 1);
                 
                 if (strlen(raw) >= 15) {  // 20260120T031500
@@ -945,9 +948,9 @@ static gboolean contacts_sync_complete_cb(gpointer data) {
     }
     if (success) {
         refresh_contacts_view();
-        log_msg("✓ Rehber güncellendi");
+        log_msg("✓ Contacts updated");
     } else {
-        log_msg("⚠️ Rehber alınamadı");
+        log_msg("⚠️ Failed to retrieve contacts");
     }
     update_ui();
     return G_SOURCE_REMOVE;
@@ -959,18 +962,18 @@ static gpointer sync_contacts_thread(gpointer data) {
     g_idle_add(contacts_sync_start_cb, NULL);
     
     if (!device_addr[0]) {
-        log_msg("⚠️ Telefon adresi yok");
+        log_msg("⚠️ No device address");
         g_idle_add(contacts_sync_complete_cb, GINT_TO_POINTER(FALSE));
         return NULL;
     }
 
     if (!ensure_obexd_running()) {
-        log_msg("⚠️ obexd bulunamadı");
+        log_msg("⚠️ obexd not found");
         g_idle_add(contacts_sync_complete_cb, GINT_TO_POINTER(FALSE));
         return NULL;
     }
 
-    // Session oluştur
+    // Create session
     GError *error = NULL;
     GVariantBuilder opts;
     g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
@@ -984,7 +987,7 @@ static gpointer sync_contacts_thread(gpointer data) {
 
     if (error || !result) {
         if (error) {
-            snprintf(error_msg, sizeof(error_msg), "PBAP session hatası: %s", error->message);
+            snprintf(error_msg, sizeof(error_msg), "PBAP session error: %s", error->message);
             log_msg(error_msg);
             g_error_free(error);
         }
@@ -1003,8 +1006,8 @@ static gpointer sync_contacts_thread(gpointer data) {
     gchar *session_copy = g_strdup(session_path);
     g_variant_unref(result);
     
-    // PhonebookAccess1 hazır olana kadar bekle
-    log_msg("ℹ️ Telefonda rehber izni bekleniyor...");
+    // Wait until PhonebookAccess1 is ready
+    log_msg("ℹ️ Waiting for phonebook permission on device...");
     gboolean ready = FALSE;
     for (int i = 0; i < 30; i++) {
         g_usleep(1000 * 1000);
@@ -1022,7 +1025,7 @@ static gpointer sync_contacts_thread(gpointer data) {
     }
     
     if (!ready) {
-        log_msg("⚠️ Telefonda rehber izni verilmedi");
+        log_msg("⚠️ Phonebook permission not granted on device");
         g_dbus_connection_call_sync(
             obex_conn, "org.bluez.obex", "/org/bluez/obex",
             "org.bluez.obex.Client1", "RemoveSession",
@@ -1032,7 +1035,7 @@ static gpointer sync_contacts_thread(gpointer data) {
         return NULL;
     }
     
-    log_msg("✓ Rehber erişimi hazır");
+    log_msg("✓ Phonebook access ready");
     
     // Select phonebook
     error = NULL;
@@ -1051,7 +1054,7 @@ static gpointer sync_contacts_thread(gpointer data) {
             g_variant_new("(ss)", "", "pb"),
             NULL, G_DBUS_CALL_FLAGS_NONE, 10000, NULL, &error);
         if (error) {
-            snprintf(error_msg, sizeof(error_msg), "PBAP Select hatası: %s", error->message);
+            snprintf(error_msg, sizeof(error_msg), "PBAP Select error: %s", error->message);
             log_msg(error_msg);
             g_error_free(error);
             g_dbus_connection_call_sync(
@@ -1078,7 +1081,7 @@ static gpointer sync_contacts_thread(gpointer data) {
     
     if (error || !result) {
         if (error) {
-            snprintf(error_msg, sizeof(error_msg), "PBAP PullAll hatası: %s", error->message);
+            snprintf(error_msg, sizeof(error_msg), "PBAP PullAll error: %s", error->message);
             log_msg(error_msg);
             g_error_free(error);
         }
@@ -1109,9 +1112,9 @@ static gpointer sync_contacts_thread(gpointer data) {
         gchar *tpath = g_strdup(transfer_path);
         g_variant_unref(result);
         
-        log_msg("ℹ️ Rehber indiriliyor...");
+        log_msg("ℹ️ Downloading contacts...");
         
-        // Transfer tamamlanana kadar bekle
+        // Wait until transfer completes
         for (int i = 0; i < 100; i++) {
             g_usleep(100 * 1000);
             GVariant *status_var = g_dbus_connection_call_sync(
@@ -1159,7 +1162,7 @@ static gpointer sync_contacts_thread(gpointer data) {
         success = (contacts_count > 0);
     }
     
-    // Session'ı kapat
+    // Close session
     if (session_copy && session_copy[0]) {
         g_dbus_connection_call_sync(
             obex_conn, "org.bluez.obex", "/org/bluez/obex",
@@ -1171,7 +1174,7 @@ static gpointer sync_contacts_thread(gpointer data) {
     return NULL;
 }
 
-// Arama sonuçlarını güncelle (UI thread)
+// Update search results (UI thread)
 static gboolean search_results_update_cb(gpointer data) {
     (void)data;
     syncing_contacts = FALSE;
@@ -1183,7 +1186,7 @@ static gboolean search_results_update_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-// Arama thread'i - sadece hafızadan arar (çok hızlı)
+// Search thread - search only in memory (very fast)
 static gpointer search_contacts_thread(gpointer data) {
     gchar *query = (gchar *)data;
     
@@ -1195,14 +1198,14 @@ static gpointer search_contacts_thread(gpointer data) {
         return NULL;
     }
     
-    // Rehber yüklü değilse mesaj ver
+    // If phonebook not loaded, show message
     if (!phonebook_loaded || all_contacts_count == 0) {
         g_free(query);
         g_idle_add(search_results_update_cb, NULL);
         return NULL;
     }
     
-    // Hafızadaki rehberden ara
+    // Search in memory phonebook
     gchar *query_lower = g_utf8_strdown(query, -1);
     
     for (int i = 0; i < all_contacts_count && contacts_count < 200; i++) {
@@ -1221,7 +1224,7 @@ static gpointer search_contacts_thread(gpointer data) {
     return NULL;
 }
 
-// Rehber yüklendiğinde UI güncelle
+// Update UI when phonebook is loaded
 static gboolean phonebook_load_complete_cb(gpointer data) {
     gboolean success = GPOINTER_TO_INT(data);
     syncing_contacts = FALSE;
@@ -1231,15 +1234,15 @@ static gboolean phonebook_load_complete_cb(gpointer data) {
     }
     if (success) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "✓ Rehber yüklendi: %d kişi", all_contacts_count);
+        snprintf(msg, sizeof(msg), "✓ Phonebook loaded: %d contacts", all_contacts_count);
         log_msg(msg);
     }
-    // Bekleyen arama varsa çalıştır
+    // Run pending search if any
     if (pending_search_query && strlen(pending_search_query) >= 2) {
         g_thread_new("search_contacts", search_contacts_thread, g_strdup(pending_search_query));
     }
     
-    // Rehber yüklendikten sonra son aramaları yükle
+    // Load recents after phonebook is loaded
     if (current_state == STATE_CONNECTED && !syncing_recents && recent_count == 0) {
         g_thread_new("load_recents", sync_recents_thread, NULL);
     }
@@ -1247,7 +1250,7 @@ static gboolean phonebook_load_complete_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-// Rehberi PBAP'tan yükle (arka plan thread)
+// Load phonebook from PBAP (background thread)
 static gpointer load_phonebook_thread(gpointer data) {
     (void)data;
     
@@ -1256,7 +1259,7 @@ static gpointer load_phonebook_thread(gpointer data) {
         return NULL;
     }
     
-    // PBAP session oluştur
+    // Create PBAP session
     GError *error = NULL;
     GVariantBuilder opts;
     g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
@@ -1279,7 +1282,7 @@ static gpointer load_phonebook_thread(gpointer data) {
     gchar *session_copy = g_strdup(session_path);
     g_variant_unref(result);
     
-    // PhonebookAccess1 hazır olana kadar bekle
+    // Wait until PhonebookAccess1 is ready
     gboolean ready = FALSE;
     for (int i = 0; i < 15; i++) {
         g_usleep(100 * 1000);
@@ -1312,7 +1315,7 @@ static gpointer load_phonebook_thread(gpointer data) {
         "org.bluez.obex.PhonebookAccess1", "Select",
         g_variant_new("(ss)", "int", "pb"), NULL, G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL);
     
-    // PullAll - tüm rehberi çek
+    // PullAll - pull entire phonebook
     GVariantBuilder pull_opts;
     g_variant_builder_init(&pull_opts, G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&pull_opts, "{sv}", "Format", g_variant_new_string("vcard21"));
@@ -1344,7 +1347,7 @@ static gpointer load_phonebook_thread(gpointer data) {
             gchar *tpath = g_strdup(transfer_path);
             g_variant_unref(result);
             
-            // 30 saniye bekle (300 x 100ms) - büyük rehberler için
+            // Wait 30 seconds (300 x 100ms) - for large phonebooks
             for (int i = 0; i < 300; i++) {
                 g_usleep(100 * 1000);
                 GVariant *status_var = g_dbus_connection_call_sync(
@@ -1386,9 +1389,9 @@ static gpointer load_phonebook_thread(gpointer data) {
         }
         
         if (filename) {
-            // VCF parse et - tüm rehberi all_contacts'a yükle
+            // Parse VCF - load entire phonebook into all_contacts
             char logbuf[256];
-            snprintf(logbuf, sizeof(logbuf), "Rehber dosyası: %s", filename);
+            snprintf(logbuf, sizeof(logbuf), "Phonebook file: %s", filename);
             log_msg(logbuf);
             FILE *f = fopen(filename, "r");
             if (f) {
@@ -1404,7 +1407,7 @@ static gpointer load_phonebook_thread(gpointer data) {
                         char *nl = strchr(name, '\n'); if (nl) *nl = '\0';
                         char *cr = strchr(name, '\r'); if (cr) *cr = '\0';
                     } else if (g_str_has_prefix(line, "N:") && !name[0]) {
-                        // N: formatı: Soyad;Ad;Diğer...
+                        // N: format: Lastname;Firstname;Other...
                         char *start = line + 2;
                         char *semi = strchr(start, ';');
                         if (semi && semi[1]) {
@@ -1413,7 +1416,7 @@ static gpointer load_phonebook_thread(gpointer data) {
                             char *nl = strchr(semi + 1, '\n'); if (nl) *nl = '\0';
                             char *cr = strchr(semi + 1, '\r'); if (cr) *cr = '\0';
                             snprintf(name, sizeof(name), "%s %s", semi + 1, start);
-                            // Temizle
+                            // Clean up
                             nl = strchr(name, ';'); if (nl) *nl = '\0';
                         }
                     } else if (g_str_has_prefix(line, "TEL")) {
@@ -1433,17 +1436,17 @@ static gpointer load_phonebook_thread(gpointer data) {
                     }
                 }
                 fclose(f);
-                snprintf(logbuf, sizeof(logbuf), "VCF: %d kart, %d kişi yüklendi", total_vcards, all_contacts_count);
+                snprintf(logbuf, sizeof(logbuf), "VCF: %d cards, %d contacts loaded", total_vcards, all_contacts_count);
                 log_msg(logbuf);
                 phonebook_loaded = TRUE;
-                save_contacts_to_csv();  // CSV'ye kaydet
+                save_contacts_to_csv();  // Save to CSV
                 success = TRUE;
             }
             g_free(filename);
         }
     }
     
-    // Session'ı kapat
+    // Close session
     if (session_copy && session_copy[0]) {
         g_dbus_connection_call_sync(
             obex_conn, "org.bluez.obex", "/org/bluez/obex",
@@ -1455,15 +1458,15 @@ static gpointer load_phonebook_thread(gpointer data) {
     return NULL;
 }
 
-// Rehberi yenile butonu
+// Refresh phonebook button
 static void on_refresh_phonebook_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
     if (current_state != STATE_CONNECTED) {
-        log_msg("⚠️ Rehber için telefon bağlı olmalı");
+        log_msg("⚠️ Phone must be connected for contacts");
         return;
     }
     if (syncing_contacts) {
-        log_msg("⚠️ Rehber zaten yükleniyor...");
+        log_msg("⚠️ Contacts already loading...");
         return;
     }
     phonebook_loaded = FALSE;
@@ -1476,28 +1479,28 @@ static void on_refresh_phonebook_clicked(GtkWidget *widget, gpointer data) {
         gtk_spinner_start(GTK_SPINNER(contacts_spinner));
         gtk_widget_show(contacts_spinner);
     }
-    log_msg("📥 Rehber yenileniyor...");
+    log_msg("📥 Refreshing contacts...");
     g_thread_new("load_phonebook", load_phonebook_thread, NULL);
 }
 
-// Debounced arama - 500ms bekle
+// Debounced search - wait 500ms
 static gboolean do_search_timeout(gpointer data) {
     (void)data;
     search_timeout_id = 0;
     
     if (pending_search_query && strlen(pending_search_query) >= 2) {
         if (!syncing_contacts && current_state == STATE_CONNECTED) {
-            // Rehber henüz yüklenmemişse önce yükle
+            // If phonebook not loaded yet, load it first
             if (!phonebook_loaded) {
                 syncing_contacts = TRUE;
                 if (contacts_spinner) {
                     gtk_spinner_start(GTK_SPINNER(contacts_spinner));
                     gtk_widget_show(contacts_spinner);
                 }
-                log_msg("📥 Rehber ilk kez yükleniyor...");
+                log_msg("📥 Loading phonebook for first time...");
                 g_thread_new("load_phonebook", load_phonebook_thread, NULL);
             } else {
-                // Rehber yüklü, hemen ara
+                // Phonebook loaded, search immediately
                 syncing_contacts = TRUE;
                 if (contacts_spinner) {
                     gtk_spinner_start(GTK_SPINNER(contacts_spinner));
@@ -1507,7 +1510,7 @@ static gboolean do_search_timeout(gpointer data) {
             }
         }
     } else {
-        // Sorgu çok kısa, listeyi temizle
+        // Query too short, clear list
         contacts_count = 0;
         refresh_contacts_view();
     }
@@ -1515,19 +1518,19 @@ static gboolean do_search_timeout(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-// Arama kutusu değiştiğinde
+// Search entry changed
 static void on_contacts_search_changed(GtkSearchEntry *entry, gpointer data) {
     (void)data;
     
     g_free(pending_search_query);
     pending_search_query = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
     
-    // Önceki timeout'u iptal et
+    // Cancel previous timeout
     if (search_timeout_id > 0) {
         g_source_remove(search_timeout_id);
     }
     
-    // 500ms sonra ara
+    // Search after 500ms
     search_timeout_id = g_timeout_add(500, do_search_timeout, NULL);
 }
 
@@ -1552,11 +1555,11 @@ static gboolean recents_sync_complete_cb(gpointer data) {
         gtk_widget_hide(recents_spinner);
     }
     if (success) {
-        save_recents_to_csv();  // CSV'ye kaydet
+        save_recents_to_csv();  // Save to CSV
         refresh_recents_view();
-        log_msg("✓ Son görüşmeler güncellendi");
+        log_msg("✓ Recent calls updated");
     } else {
-        log_msg("⚠️ Son görüşmeler alınamadı");
+        log_msg("⚠️ Recent calls not retrieved");
     }
     update_ui();
     return G_SOURCE_REMOVE;
@@ -1568,13 +1571,13 @@ static gpointer sync_recents_thread(gpointer data) {
     g_idle_add(recents_sync_start_cb, NULL);
     
     if (!device_addr[0]) {
-        log_msg("⚠️ Telefon adresi yok");
+        log_msg("⚠️ No device address");
         g_idle_add(recents_sync_complete_cb, GINT_TO_POINTER(FALSE));
         return NULL;
     }
 
     if (!ensure_obexd_running()) {
-        log_msg("⚠️ obexd bulunamadı");
+        log_msg("⚠️ obexd not found");
         g_idle_add(recents_sync_complete_cb, GINT_TO_POINTER(FALSE));
         return NULL;
     }
@@ -1583,9 +1586,9 @@ static gpointer sync_recents_thread(gpointer data) {
     gboolean any_success = FALSE;
     
     const char *phonebooks[] = {"ich", "och", "mch"};
-    const char *types[] = {"📥 Gelen", "📤 Giden", "❌ Cevapsız"};
+    const char *types[] = {"📥 Incoming", "📤 Outgoing", "❌ Missed"};
     
-    // TEK session oluştur - tüm phonebook'lar için
+    // Create SINGLE session - for all phonebooks
     GError *error = NULL;
     GVariantBuilder opts;
     g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
@@ -1599,7 +1602,7 @@ static gpointer sync_recents_thread(gpointer data) {
 
     if (error || !result) {
         if (error) g_error_free(error);
-        log_msg("⚠️ PBAP session kurulamadı");
+        log_msg("⚠️ PBAP session failed");
         g_idle_add(recents_sync_complete_cb, GINT_TO_POINTER(FALSE));
         return NULL;
     }
@@ -1609,7 +1612,7 @@ static gpointer sync_recents_thread(gpointer data) {
     gchar *session_copy = g_strdup(session_path);
     g_variant_unref(result);
     
-    // PhonebookAccess1 hazır olana kadar bekle
+    // Wait until PhonebookAccess1 is ready
     gboolean ready = FALSE;
     for (int i = 0; i < 15; i++) {
         g_usleep(100 * 1000);
@@ -1627,7 +1630,7 @@ static gpointer sync_recents_thread(gpointer data) {
     }
     
     if (!ready) {
-        log_msg("⚠️ PhonebookAccess1 hazır değil");
+        log_msg("⚠️ PhonebookAccess1 not ready");
         g_dbus_connection_call_sync(
             obex_conn, "org.bluez.obex", "/org/bluez/obex",
             "org.bluez.obex.Client1", "RemoveSession",
@@ -1649,7 +1652,7 @@ static gpointer sync_recents_thread(gpointer data) {
         if (error) {
             g_error_free(error);
             error = NULL;
-            // Boş location dene
+            // Try empty location
             g_dbus_connection_call_sync(
                 obex_conn, "org.bluez.obex", session_copy,
                 "org.bluez.obex.PhonebookAccess1", "Select",
@@ -1657,11 +1660,11 @@ static gpointer sync_recents_thread(gpointer data) {
                 NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, &error);
             if (error) {
                 g_error_free(error);
-                continue;  // session_copy'yi serbest bırakma, döngü devam etsin
+                continue;  // Continue loop, don't free session_copy yet
             }
         }
         
-        // PullAll - son 33 kayıt (3 kategori x 33 = ~100 toplam)
+        // PullAll - last 33 records (3 categories x 33 = ~100 total)
         GVariantBuilder pull_opts;
         g_variant_builder_init(&pull_opts, G_VARIANT_TYPE_VARDICT);
         g_variant_builder_add(&pull_opts, "{sv}", "Format", g_variant_new_string("vcard21"));
@@ -1698,7 +1701,7 @@ static gpointer sync_recents_thread(gpointer data) {
             gchar *tpath = g_strdup(transfer_path);
             g_variant_unref(result);
             
-            // Transfer tamamlanana kadar bekle (max 3 saniye)
+            // Wait until transfer completes (max 3 seconds)
             for (int i = 0; i < 60; i++) {
                 g_usleep(50 * 1000);
                 GVariant *status_var = g_dbus_connection_call_sync(
@@ -1746,17 +1749,17 @@ static gpointer sync_recents_thread(gpointer data) {
         }
     }
     
-    // Tüm kayıtları zamana göre sırala (en yeniden en eskiye)
+    // Sort all records by time (newest to oldest)
     if (recent_count > 1) {
         qsort(recent_entries, recent_count, sizeof(RecentEntry), compare_recents);
     }
     
-    // Son 100 kayıtla sınırla
+    // Limit to last 100 records
     if (recent_count > 100) {
         recent_count = 100;
     }
     
-    // Session'ı kapat (döngü bittikten sonra)
+    // Close session (after loop)
     if (session_copy && session_copy[0]) {
         g_dbus_connection_call_sync(
             obex_conn, "org.bluez.obex", "/org/bluez/obex",
@@ -1773,22 +1776,22 @@ static gpointer sync_recents_thread(gpointer data) {
 static void on_sync_recents_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
     if (current_state != STATE_CONNECTED) {
-        log_msg("⚠️ Son görüşmeler için telefon bağlı olmalı");
+        log_msg("⚠️ Phone must be connected for recent calls");
         return;
     }
     if (syncing_recents) {
-        log_msg("⚠️ Son görüşmeler zaten alınıyor...");
+        log_msg("⚠️ Recent calls already retrieving...");
         return;
     }
-    log_msg("📥 Son görüşmeler alınıyor...");
+    log_msg("📥 Retrieving recent calls...");
     g_thread_new("pbap_recents", sync_recents_thread, NULL);
 }
 
-// HFP monitoring thread - bağlantıyı açık tutar ve olayları dinler
+// HFP monitoring thread - keeps connection open and listens for events
 static gboolean hfp_monitor_running = FALSE;
 static GThread *hfp_monitor_thread_handle = NULL;
 
-// Sadece UI'ı refresh et (state değiştirmeden)
+// Just refresh UI (without changing state)
 static gboolean hfp_refresh_ui_cb(gpointer data) {
     (void)data;
     update_call_ui();
@@ -1798,7 +1801,7 @@ static gboolean hfp_refresh_ui_cb(gpointer data) {
 static gboolean restart_incoming_listener_cb(gpointer data) {
     (void)data;
     if (current_state == STATE_CONNECTED && !incoming_call_thread) {
-        log_msg("🔁 Dinleyici yeniden başlatılıyor");
+        log_msg("🔁 Restarting listener");
         start_incoming_call_listener();
     }
     return G_SOURCE_REMOVE;
@@ -1807,7 +1810,7 @@ static gboolean restart_incoming_listener_cb(gpointer data) {
 static gboolean hfp_update_call_state_cb(gpointer data) {
     CallState new_state = GPOINTER_TO_INT(data);
     
-    // Sadece IDLE durumuna geçerken sıfırla
+    // Only reset when going to IDLE
     if (new_state == CALL_IDLE) {
         stop_sco_audio(NULL);
         clear_call_info();
@@ -1821,14 +1824,14 @@ static gboolean hfp_update_call_state_cb(gpointer data) {
 static void handle_ciev_event(int ind, int val) {
     if (ind == 1) {  // Call indicator
         if (val == 1) {
-            log_msg("✓ Arama aktif");
+            log_msg("✓ Call active");
             if (!sco_audio_running && sco_socket < 0) {
                 sco_connect();
             }
             g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_ACTIVE));
         } else if (val == 0) {
             if (current_call_state != CALL_IDLE) {
-                log_msg("📱 Arama sonlandı");
+                log_msg("📱 Call ended");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
             }
         }
@@ -1838,9 +1841,9 @@ static void handle_ciev_event(int ind, int val) {
     if (ind == 2) {  // Call setup indicator
         if (val == 0) {
             if (current_call_state == CALL_OUTGOING || current_call_state == CALL_RINGING) {
-                log_msg("✓ Arama kurulumu tamamlandı (setup=0)");
+                log_msg("✓ Call setup completed (setup=0)");
             }
-            // Setup bitti ama aktif arama yoksa UI'ı temizle
+            // If setup finished but no active call, clear UI
             if (current_call_state != CALL_ACTIVE) {
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
             }
@@ -1848,14 +1851,14 @@ static void handle_ciev_event(int ind, int val) {
         }
         if (val == 1) {
             if (current_call_state != CALL_RINGING) {
-                log_msg("🔔 GELEN ARAMA (CIEV)");
+                log_msg("🔔 INCOMING CALL (CIEV)");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_RINGING));
             }
             return;
         }
         if (val == 2 || val == 3) {
             if (current_call_state != CALL_OUTGOING) {
-                log_msg("📱 Giden arama (CIEV)");
+                log_msg("📱 Outgoing call (CIEV)");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_OUTGOING));
             }
             if (!sco_audio_running && sco_socket < 0) {
@@ -1871,7 +1874,7 @@ static gpointer hfp_monitor_thread(gpointer data) {
     char buf[512];
     int n;
     
-    log_msg("🔊 HFP monitor başlatıldı");
+    log_msg("🔊 HFP monitor started");
     
     while (hfp_monitor_running) {
         int sock = hfp_socket;  // Local copy
@@ -1887,10 +1890,10 @@ static gpointer hfp_monitor_thread(gpointer data) {
         
         int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
         
-        // Durduruldu mu kontrol et
+        // Check if stopped
         if (!hfp_monitor_running) break;
         
-        // Socket hala geçerli mi?
+        // Is socket still valid?
         if (hfp_socket < 0) break;
         
         if (ret > 0 && FD_ISSET(sock, &readfds)) {
@@ -1898,9 +1901,9 @@ static gpointer hfp_monitor_thread(gpointer data) {
             n = read(sock, buf, sizeof(buf) - 1);
             
             if (n <= 0) {
-                // Bağlantı kesildi
+                // Connection lost
                 if (hfp_monitor_running) {
-                    log_msg("⚠️ HFP bağlantısı kesildi");
+                    log_msg("⚠️ HFP connection lost");
                     g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
                 }
                 if (hfp_socket >= 0) {
@@ -1911,14 +1914,14 @@ static gpointer hfp_monitor_thread(gpointer data) {
                 break;
             }
             
-            // AT olaylarını parse et
+            // Parse AT events
             if (strstr(buf, "+CIEV")) {
                 int ind = -1, val = -1;
                 if (parse_ciev(buf, &ind, &val)) {
                     handle_ciev_event(ind, val);
                 }
             } else if (strstr(buf, "NO CARRIER") || strstr(buf, "BUSY") || strstr(buf, "NO ANSWER")) {
-                log_msg("📱 Arama sonlandı");
+                log_msg("📱 Call ended");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
                 break;
             }
@@ -1927,42 +1930,42 @@ static gpointer hfp_monitor_thread(gpointer data) {
         }
     }
     
-    log_msg("🔊 HFP monitor durduruldu");
+    log_msg("🔊 HFP monitor stopped");
     hfp_monitor_running = FALSE;
     return NULL;
 }
 
-// HFP bağlantısını kapat (thread-safe)
+// Close HFP connection (thread-safe)
 static void hfp_close(void) {
-    // Önce monitor'u durdur
+    // Stop monitor first
     hfp_monitor_running = FALSE;
-    sco_audio_running = FALSE;  // Audio thread'leri durdur
+    sco_audio_running = FALSE;  // Stop audio threads
     
-    // SCO socket'i kapat - bu thread'lerin bitmesini tetikler
+    // Close SCO socket - this triggers thread shutdown
     if (sco_socket >= 0) {
         shutdown(sco_socket, SHUT_RDWR);
         close(sco_socket);
         sco_socket = -1;
-        log_msg("🔊 SCO audio kapatıldı");
+        log_msg("🔊 SCO audio closed");
     }
     
-    // Thread'lerin kendi PulseAudio'larını kapatmasını bekle
-    usleep(100000);  // 100ms bekle
+    // Wait for threads to close their PulseAudio
+    usleep(100000);  // 100ms wait
     
-    // Socket'i kapat
+    // Close socket
     if (hfp_socket >= 0) {
-        shutdown(hfp_socket, SHUT_RDWR);  // select'i uyandır
+        shutdown(hfp_socket, SHUT_RDWR);  // Wake up select
         close(hfp_socket);
         hfp_socket = -1;
     }
     
-    // Thread'in bitmesini bekle (max 1 saniye)
+    // Wait for thread to finish (max 1 second)
     if (hfp_monitor_thread_handle) {
         g_thread_join(hfp_monitor_thread_handle);
         hfp_monitor_thread_handle = NULL;
     }
     
-    log_msg("✓ HFP bağlantısı kapatıldı");
+    log_msg("✓ HFP connection closed");
 }
 
 // Lambda helper for thread-safe logging
@@ -1972,20 +1975,20 @@ static gboolean lambda_log(char *msg) {
     return FALSE;
 }
 
-// Gelen aramayı cevapla callback
+// Answer incoming call callback
 static gboolean answer_incoming_call_cb(gpointer data) {
     (void)data;
     
     if (hfp_listen_socket >= 0) {
-        // ATA komutu gönder - aramayı cevapla
+        // Send ATA command - answer call
         char cmd[] = "ATA\r";
         if (write(hfp_listen_socket, cmd, strlen(cmd)) > 0) {
             usleep(200000);
             char buf[256] = {0};
             read(hfp_listen_socket, buf, sizeof(buf) - 1);
-            log_msg("✓ Arama cevaplandı");
+            log_msg("✓ Call answered");
             
-            // SCO bağlantısı kur
+            // Establish SCO connection
             sco_connect();
             
             set_call_state(CALL_ACTIVE);
@@ -1994,18 +1997,18 @@ static gboolean answer_incoming_call_cb(gpointer data) {
     return FALSE;
 }
 
-// Gelen aramayı reddet callback
+// Reject incoming call callback
 static gboolean reject_incoming_call_cb(gpointer data) {
     (void)data;
     
     if (hfp_listen_socket >= 0) {
-        // AT+CHUP - aramayı reddet
+        // AT+CHUP - reject call
         char cmd[] = "AT+CHUP\r";
         if (write(hfp_listen_socket, cmd, strlen(cmd)) > 0) {
             usleep(200000);
             char buf[256] = {0};
             read(hfp_listen_socket, buf, sizeof(buf) - 1);
-            log_msg("📱 Arama reddedildi");
+            log_msg("📱 Call rejected");
         }
     }
     set_call_state(CALL_IDLE);
@@ -2014,31 +2017,30 @@ static gboolean reject_incoming_call_cb(gpointer data) {
     return FALSE;
 }
 
-// Gelen arama dinleyici thread
+// Incoming call listener thread
 static gpointer incoming_call_listener(gpointer data) {
     (void)data;
     
-    log_msg("📞 Gelen arama dinleyici başlatıldı");
+    log_msg("📞 Incoming call listener started");
     
-    // HFP bağlantısı kur
+    // Establish HFP connection
     hfp_listen_socket = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
     if (hfp_listen_socket < 0) {
-        log_msg("⚠️ Dinleyici soket hatası");
+        log_msg("⚠️ Listener socket error");
         return NULL;
     }
     
     struct sockaddr_rc addr = {0};
     addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dinamik veya varsayılan
+    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dynamic or default
     str2ba(device_addr, &addr.rc_bdaddr);
     
     if (connect(hfp_listen_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_msg("⚠️ Dinleyici bağlantı hatası");
+        log_msg("⚠️ Listener connection error");
         close(hfp_listen_socket);
         hfp_listen_socket = -1;
         return NULL;
     }
-    
     // SLC handshake
     char buf[512];
     char cmd[64];
@@ -2061,21 +2063,31 @@ static gpointer incoming_call_listener(gpointer data) {
     usleep(100000);
     read(hfp_listen_socket, buf, sizeof(buf) - 1);
     
-    // AT+CMER - event reporting aktif
+    // AT+CMER - event reporting active
     snprintf(cmd, sizeof(cmd), "AT+CMER=3,0,0,1\r");
     write(hfp_listen_socket, cmd, strlen(cmd));
     usleep(100000);
     read(hfp_listen_socket, buf, sizeof(buf) - 1);
     
-    // AT+CLIP - arayan numara gösterimi aktif
+    // AT+CLIP - caller ID display active
     snprintf(cmd, sizeof(cmd), "AT+CLIP=1\r");
     write(hfp_listen_socket, cmd, strlen(cmd));
     usleep(100000);
     read(hfp_listen_socket, buf, sizeof(buf) - 1);
     
-    log_msg("✓ Gelen arama dinleyici hazır");
+    log_msg("✓ Incoming call listener ready");
     
-    // Olayları dinle
+    // Pending dial from tel: URI
+    if (pending_dial_number[0]) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "📞 Auto-dialing: %s", pending_dial_number);
+        log_msg(msg);
+        usleep(500000);  // Wait a bit for connection to stabilize
+        dial_number(pending_dial_number);
+        pending_dial_number[0] = '\0';  // Clear after dialing
+    }
+    
+    // Listen for events
     while (incoming_call_running && hfp_listen_socket >= 0) {
         if (hfp_listen_paused) {
             usleep(100000);
@@ -2101,21 +2113,21 @@ static gpointer incoming_call_listener(gpointer data) {
             ssize_t n = read(hfp_listen_socket, buf, sizeof(buf) - 1);
             
             if (n <= 0) {
-                log_msg("⚠️ Dinleyici bağlantısı kesildi");
+                log_msg("⚠️ Listener connection lost");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
                 g_idle_add(restart_incoming_listener_cb, NULL);
                 break;
             }
             
-            // Debug: gelen veriyi logla
+            // Debug: log incoming data
             char debug_msg[128];
             snprintf(debug_msg, sizeof(debug_msg), "📥 HFP: %.60s", buf);
             log_msg(debug_msg);
             
-            // +CLIP ile numara al (RING'den ayrı gelebilir)
+            // +CLIP to get number (may come separately from RING)
             char *clip = strstr(buf, "+CLIP:");
             if (clip) {
-                // +CLIP: "numara",129,,,"isim" formatı
+                // +CLIP: "number",129,,,"name" format
                 char *num_start = strchr(clip, '"');
                 if (num_start) {
                     num_start++;
@@ -2124,7 +2136,7 @@ static gpointer incoming_call_listener(gpointer data) {
                         *num_end = '\0';
                         strncpy(current_call_number, num_start, sizeof(current_call_number) - 1);
                         
-                        // İsmi +CLIP'den al (5. tırnak içinde)
+                        // Get name from +CLIP (in 5th quote)
                         current_call_name[0] = '\0';
                         char *name_search = num_end + 1;
                         int quote_count = 0;
@@ -2148,7 +2160,7 @@ static gpointer incoming_call_listener(gpointer data) {
                             }
                         }
                         
-                        // İsim +CLIP'den gelmezse rehberden bul
+                        // If name not from +CLIP, find from contacts
                         if (!current_call_name[0]) {
                             char normalized_incoming[32] = {0};
                             int incoming_len = strlen(current_call_number);
@@ -2176,13 +2188,13 @@ static gpointer incoming_call_listener(gpointer data) {
                         
                         char msg[256];
                         if (current_call_name[0]) {
-                            snprintf(msg, sizeof(msg), "📱 Arayan: %s (%s)", current_call_name, current_call_number);
+                            snprintf(msg, sizeof(msg), "📱 Caller: %s (%s)", current_call_name, current_call_number);
                         } else {
-                            snprintf(msg, sizeof(msg), "📱 Arayan: %s", current_call_number);
+                            snprintf(msg, sizeof(msg), "📱 Caller: %s", current_call_number);
                         }
                         log_msg(msg);
                         
-                        // UI'ı güncelle (zaten RINGING ise sadece refresh)
+                        // Update UI (refresh if already RINGING)
                         if (current_call_state == CALL_RINGING) {
                             g_idle_add(hfp_refresh_ui_cb, NULL);
                         } else {
@@ -2192,13 +2204,13 @@ static gpointer incoming_call_listener(gpointer data) {
                 }
             }
             
-            // RING - gelen arama (numara olmadan da olabilir)
+            // RING - incoming call (may be without number)
             if (strstr(buf, "RING") && current_call_state != CALL_RINGING) {
-                log_msg("🔔 GELEN ARAMA!");
+                log_msg("🔔 INCOMING CALL!");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_RINGING));
             }
             
-            // CIEV olayları: ind=1 (call), ind=2 (callsetup)
+            // CIEV events: ind=1 (call), ind=2 (callsetup)
             if (strstr(buf, "+CIEV:")) {
                 int ind = -1, val = -1;
                 if (parse_ciev(buf, &ind, &val)) {
@@ -2206,7 +2218,7 @@ static gpointer incoming_call_listener(gpointer data) {
                 }
             }
             else if (strstr(buf, "NO CARRIER") || strstr(buf, "BUSY") || strstr(buf, "NO ANSWER") || strstr(buf, "ERROR")) {
-                log_msg("📱 Arama sonlandı");
+                log_msg("📱 Call ended");
                 g_idle_add(hfp_update_call_state_cb, GINT_TO_POINTER(CALL_IDLE));
             }
         }
@@ -2220,20 +2232,20 @@ static gpointer incoming_call_listener(gpointer data) {
     incoming_call_running = FALSE;
     incoming_call_thread = NULL;
 
-    log_msg("📞 Gelen arama dinleyici durdu");
+    log_msg("📞 Incoming call listener stopped");
     return NULL;
 }
 
-// Gelen arama dinleyiciyi başlat
+// Start incoming call listener
 static void start_incoming_call_listener(void) {
-    if (incoming_call_thread) return;  // Zaten çalışıyor
-    if (!device_addr[0]) return;  // Cihaz yok
+    if (incoming_call_thread) return;  // Already running
+    if (!device_addr[0]) return;  // No device
     
     incoming_call_running = TRUE;
     incoming_call_thread = g_thread_new("incoming-call", incoming_call_listener, NULL);
 }
 
-// Gelen arama dinleyiciyi durdur
+// Stop incoming call listener
 static void stop_incoming_call_listener(void) {
     incoming_call_running = FALSE;
     
@@ -2293,7 +2305,7 @@ static void init_webrtc_aec(void) {
     if (aec_force_disable) {
         aec_enabled = FALSE;
         aec_fifo_clear();
-        log_msg("⚠️ WebRTC AEC kapalı (robotik ses önleme)");
+        log_msg("⚠️ WebRTC AEC disabled (robot voice prevention)");
         return;
     }
     pthread_mutex_lock(&aec_mutex);
@@ -2308,9 +2320,9 @@ static void init_webrtc_aec(void) {
     aec_enabled = FALSE;
 #endif
     if (aec_enabled) {
-        log_msg("✅ WebRTC AEC aktif");
+        log_msg("✅ WebRTC AEC active");
     } else {
-        log_msg("⚠️ WebRTC AEC devre dışı");
+        log_msg("⚠️ WebRTC AEC disabled");
     }
     aec_fifo_clear();
 }
@@ -2328,11 +2340,11 @@ static void shutdown_webrtc_aec(void) {
     aec_fifo_clear();
 }
 
-// SCO -> PulseAudio playback thread (telefon sesini PC'ye)
+// SCO -> PulseAudio playback thread (phone audio to PC)
 static void* sco_playback_thread_func(void *data) {
     (void)data;
     
-    // PulseAudio format: 8kHz mono 16-bit (SCO standart)
+    // PulseAudio format: 8kHz mono 16-bit (SCO standard)
     pa_sample_spec ss = {
         .format = PA_SAMPLE_S16LE,
         .rate = 8000,
@@ -2345,7 +2357,7 @@ static void* sco_playback_thread_func(void *data) {
         "BT Headset",       // app name
         PA_STREAM_PLAYBACK,
         NULL,               // default device
-        "Telefon Sesi",     // stream description
+        "Phone Audio",      // stream description
         &ss,
         NULL,               // default channel map
         NULL,               // default buffering
@@ -2353,11 +2365,11 @@ static void* sco_playback_thread_func(void *data) {
     );
     
     if (!pulse_playback) {
-        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Hoparlör açılamadı: %s", pa_strerror(err)));
+        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Speaker could not be opened: %s", pa_strerror(err)));
         return NULL;
     }
     
-    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔊 Hoparlör aktif - telefon sesi geliyor"));
+    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔊 Speaker active - phone audio coming"));
     
     unsigned char buf[240];
     ssize_t bytes_read;
@@ -2366,7 +2378,7 @@ static void* sco_playback_thread_func(void *data) {
         bytes_read = recv(sco_socket, buf, sizeof(buf), 0);
         if (bytes_read <= 0) {
             if (sco_audio_running) {
-                g_idle_add((GSourceFunc)lambda_log, g_strdup("⚠️ Telefon sesi kesildi"));
+                g_idle_add((GSourceFunc)lambda_log, g_strdup("⚠️ Phone audio cut"));
             }
             break;
         }
@@ -2378,7 +2390,7 @@ static void* sco_playback_thread_func(void *data) {
         }
         
         if (pa_simple_write(pulse_playback, buf, bytes_read, &err) < 0) {
-            g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Ses yazma hatası: %s", pa_strerror(err)));
+            g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Audio write error: %s", pa_strerror(err)));
             break;
         }
     }
@@ -2389,15 +2401,15 @@ static void* sco_playback_thread_func(void *data) {
         pulse_playback = NULL;
     }
     
-    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔇 Hoparlör kapatıldı"));
+    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔇 Speaker closed"));
     return NULL;
 }
 
-// PulseAudio -> SCO capture thread (PC mikrofonunu telefona)
+// PulseAudio -> SCO capture thread (PC microphone to phone)
 static void* sco_capture_thread_func(void *data) {
     (void)data;
     
-    // PulseAudio format: 8kHz mono 16-bit (SCO standart)
+    // PulseAudio format: 8kHz mono 16-bit (SCO standard)
     pa_sample_spec ss = {
         .format = PA_SAMPLE_S16LE,
         .rate = 8000,
@@ -2409,8 +2421,8 @@ static void* sco_capture_thread_func(void *data) {
         NULL,               // default server
         "BT Headset",       // app name
         PA_STREAM_RECORD,
-        NULL,               // default device (mikrofon)
-        "PC Mikrofon",      // stream description
+        NULL,               // default device (microphone)
+        "PC Microphone",    // stream description
         &ss,
         NULL,               // default channel map
         NULL,               // default buffering
@@ -2418,13 +2430,13 @@ static void* sco_capture_thread_func(void *data) {
     );
     
     if (!pulse_capture) {
-        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon açılamadı: %s", pa_strerror(err)));
+        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Microphone could not be opened: %s", pa_strerror(err)));
         return NULL;
     }
     
-    g_idle_add((GSourceFunc)lambda_log, g_strdup("🎤 Mikrofon aktif - sesiniz telefona gidiyor"));
+    g_idle_add((GSourceFunc)lambda_log, g_strdup("🎤 Microphone active - your voice going to phone"));
     
-    const int mtu = sco_mtu;  // Dinamik MTU
+    const int mtu = sco_mtu;  // Dynamic MTU
     unsigned char buf[AEC_FRAME_BYTES];
     int16_t render_frame[AEC_FRAME_SAMPLES];
     int send_error_logged = 0;
@@ -2432,10 +2444,10 @@ static void* sco_capture_thread_func(void *data) {
     while (sco_audio_running && sco_socket >= 0) {
         int read_bytes = aec_enabled ? AEC_FRAME_BYTES : mtu;
 
-        // Mikrofondan oku
+        // Read from microphone
         if (pa_simple_read(pulse_capture, buf, read_bytes, &err) < 0) {
             if (sco_audio_running) {
-                g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon okuma hatası: %s", pa_strerror(err)));
+                g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Microphone read error: %s", pa_strerror(err)));
             }
             break;
         }
@@ -2454,7 +2466,7 @@ static void* sco_capture_thread_func(void *data) {
 #endif
         }
         
-        // SCO'ya gönder - MTU boyutunda parçalara böl
+        // Send to SCO - split into MTU sized chunks
         for (int offset = 0; offset < read_bytes; offset += mtu) {
             int chunk = read_bytes - offset;
             if (chunk > mtu) chunk = mtu;
@@ -2462,17 +2474,17 @@ static void* sco_capture_thread_func(void *data) {
             if (sent <= 0) {
                 if (errno == EPIPE || errno == ENOTCONN || errno == ECONNRESET) {
                     if (!send_error_logged) {
-                        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon gönderme hatası: %s", strerror(errno)));
+                        g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Microphone send error: %s", strerror(errno)));
                         send_error_logged = 1;
                     }
-                    stop_sco_audio("🔇 SCO kapatıldı (karşı uç kapattı)");
+                    stop_sco_audio("🔇 SCO closed (remote closed)");
                     return NULL;
                 }
                 if (sco_audio_running && errno != EAGAIN && errno != EWOULDBLOCK && !send_error_logged) {
-                    g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Mikrofon gönderme hatası: %s", strerror(errno)));
+                    g_idle_add((GSourceFunc)lambda_log, g_strdup_printf("⚠️ Microphone send error: %s", strerror(errno)));
                     send_error_logged = 1;
                 }
-                usleep(1000);  // Kısa bekle ve tekrar dene
+                usleep(1000);  // Short wait and retry
                 continue;
             }
         }
@@ -2483,66 +2495,88 @@ static void* sco_capture_thread_func(void *data) {
         pulse_capture = NULL;
     }
     
-    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔇 Mikrofon kapatıldı"));
+    g_idle_add((GSourceFunc)lambda_log, g_strdup("🔇 Microphone closed"));
     return NULL;
 }
 
-// SCO audio bağlantısı kur
+// Establish SCO audio connection
 static gboolean sco_connect(void) {
     if (!device_addr[0]) {
         return FALSE;
     }
 
-    // Önceki bağlantı hala açıksa bekle
+    // Wait if previous connection still open
     if (sco_audio_running) {
-        log_msg("ℹ️ Önceki SCO kapatılıyor...");
+        log_msg("ℹ️ Closing previous SCO...");
         stop_sco_audio(NULL);
-        usleep(100000);  // 100ms ekstra bekle
+        usleep(100000);  // 100ms extra wait
     }
 
     if (sco_socket >= 0) {
-        // Socket açık ama thread yok - temizle
+        // Socket open but no thread - clean up
         shutdown(sco_socket, SHUT_RDWR);
         close(sco_socket);
         sco_socket = -1;
         usleep(50000);
     }
     
-    // SCO socket oluştur
+    // Create SCO socket
     sco_socket = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO);
     if (sco_socket < 0) {
-        log_msg("⚠️ SCO soket hatası");
+        log_msg("⚠️ SCO socket error");
         return FALSE;
     }
     
-    // SCO ses kalitesi ayarları (mSBC için)
-    struct bt_voice voice = { .setting = BT_VOICE_CVSD_16BIT };  // veya BT_VOICE_TRANSPARENT
+    // SCO voice quality settings (for mSBC)
+    struct bt_voice voice = { .setting = BT_VOICE_CVSD_16BIT };  // or BT_VOICE_TRANSPARENT
     if (setsockopt(sco_socket, SOL_BLUETOOTH, BT_VOICE, &voice, sizeof(voice)) < 0) {
-        // Hata olsa bile devam et - bazı sistemlerde desteklenmez
+        // Continue even if error - not supported on some systems
         char msg[128];
-        snprintf(msg, sizeof(msg), "ℹ️ SCO voice ayarı: %s", strerror(errno));
+        snprintf(msg, sizeof(msg), "ℹ️ SCO voice setting: %s", strerror(errno));
         log_msg(msg);
     }
     
-    // Bağlantı adresi
+    // Connection address
     struct sockaddr_sco addr = {0};
     addr.sco_family = AF_BLUETOOTH;
     str2ba(device_addr, &addr.sco_bdaddr);
     
-    // Bağlan
-    log_msg("🔊 SCO audio bağlanıyor...");
+    // Connect
+    log_msg("🔊 SCO audio connecting...");
     if (connect(sco_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        int err = errno;
         char msg[128];
-        snprintf(msg, sizeof(msg), "⚠️ SCO bağlantı hatası: %s", strerror(errno));
+        snprintf(msg, sizeof(msg), "⚠️ SCO connection error: %s", strerror(err));
         log_msg(msg);
         close(sco_socket);
         sco_socket = -1;
+        
+        // EMLINK (Too many links) or EBUSY error - existing SCO
+        if (err == EMLINK || err == EBUSY) {
+            log_msg("ℹ️ Clearing existing SCO connection...");
+            // Reload PulseAudio Bluetooth module
+            system("pactl unload-module module-bluez5-device 2>/dev/null");
+            usleep(200000);  // 200ms wait
+            
+            // Try again
+            sco_socket = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO);
+            if (sco_socket >= 0) {
+                setsockopt(sco_socket, SOL_BLUETOOTH, BT_VOICE, &voice, sizeof(voice));
+                if (connect(sco_socket, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    log_msg("✓ SCO audio connected (retry)");
+                    goto sco_connected;
+                }
+                close(sco_socket);
+                sco_socket = -1;
+            }
+        }
         return FALSE;
     }
     
-    log_msg("✓ SCO audio bağlandı");
+sco_connected:
+    log_msg("✓ SCO audio connected");
 
-    // SCO MTU'yu dinamik oku
+    // Read SCO MTU dynamically
     struct sco_options sco_opts;
     socklen_t optlen = sizeof(sco_opts);
     if (getsockopt(sco_socket, SOL_SCO, SCO_OPTIONS, &sco_opts, &optlen) == 0) {
@@ -2551,39 +2585,39 @@ static gboolean sco_connect(void) {
         snprintf(msg, sizeof(msg), "ℹ️ SCO MTU: %d byte", sco_mtu);
         log_msg(msg);
     } else {
-        sco_mtu = 48;  // Varsayılan
-        log_msg("ℹ️ SCO MTU okunamadı, varsayılan: 48");
+        sco_mtu = 48;  // Default
+        log_msg("ℹ️ SCO MTU not readable, default: 48");
     }
 
     init_webrtc_aec();
     
-    // Playback thread'i başlat (telefon -> PC hoparlör)
+    // Start playback thread (phone -> PC speaker)
     sco_audio_running = TRUE;
     if (pthread_create(&sco_playback_thread, NULL, sco_playback_thread_func, NULL) != 0) {
-        log_msg("⚠️ Hoparlör thread hatası");
+        log_msg("⚠️ Speaker thread error");
     }
     
-    // Capture thread'i başlat (PC mikrofon -> telefon)
+    // Start capture thread (PC microphone -> phone)
     if (pthread_create(&sco_capture_thread, NULL, sco_capture_thread_func, NULL) != 0) {
-        log_msg("⚠️ Mikrofon thread hatası");
+        log_msg("⚠️ Microphone thread error");
     }
     
     return TRUE;
 }
 
-// HFP üzerinden aramayı bitir
+// Hang up call via HFP
 static void hfp_hangup(void) {
-    hfp_monitor_running = FALSE;  // Önce monitor'u durdur
+    hfp_monitor_running = FALSE;  // Stop monitor first
     
     if (hfp_socket >= 0) {
-        // AT+CHUP gönder
+        // Send AT+CHUP
         char cmd[] = "AT+CHUP\r";
         if (write(hfp_socket, cmd, strlen(cmd)) > 0) {
             usleep(200000);
             char buf[256] = {0};
             read(hfp_socket, buf, sizeof(buf) - 1);
         }
-        log_msg("📱 Arama sonlandırıldı");
+        log_msg("📱 Call terminated");
     }
     
     hfp_close();
@@ -2592,60 +2626,60 @@ static void hfp_hangup(void) {
     current_call_name[0] = '\0';
 }
 
-// Numarayı ara - numarayı panoya kopyala ve bildirim göster
-// HFP üzerinden arama başlat (RFCOMM)
+// Dial number - copy number to clipboard and show notification
+// Start call via HFP (RFCOMM)
 static gboolean hfp_dial(const char *number) {
     if (!device_addr[0]) {
-        log_msg("⚠️ Telefon adresi yok");
+        log_msg("⚠️ No phone address");
         return FALSE;
     }
     
-    // Dinleyici soketi varsa onu kullan
+    // Use existing listener socket if available
     if (hfp_listen_socket >= 0) {
-        log_msg("📱 Mevcut HFP bağlantısı kullanılıyor...");
+        log_msg("📱 Using existing HFP connection...");
 
         hfp_listen_paused = TRUE;
         usleep(150000);
         
-        // Aramayı başlat
+        // Start call
         char cmd[128];
         char buf[512];
         
         snprintf(cmd, sizeof(cmd), "ATD%s;\r", number);
         if (write(hfp_listen_socket, cmd, strlen(cmd)) <= 0) {
-            log_msg("⚠️ Arama komutu gönderilemedi");
+            log_msg("⚠️ Call command could not be sent");
             hfp_listen_paused = FALSE;
             return FALSE;
         }
         
-        usleep(500000);  // 500ms bekle
+        usleep(500000);  // 500ms wait
         memset(buf, 0, sizeof(buf));
         int n = read(hfp_listen_socket, buf, sizeof(buf) - 1);
         
         // Debug log
         char debug_msg[600];
-        snprintf(debug_msg, sizeof(debug_msg), "📥 HFP yanıt (%d byte): [%s]", n, buf);
+        snprintf(debug_msg, sizeof(debug_msg), "📥 HFP response (%d byte): [%s]", n, buf);
         log_msg(debug_msg);
         
-        // OK, +CIEV (call setup indicator), veya CONNECT = başarılı
+        // OK, +CIEV (call setup indicator), or CONNECT = success
         if (strstr(buf, "OK") || strstr(buf, "+CIEV") || strstr(buf, "CONNECT")) {
             char msg[128];
-            snprintf(msg, sizeof(msg), "✓ Arama başlatıldı: %s", number);
+            snprintf(msg, sizeof(msg), "✓ Call started: %s", number);
             log_msg(msg);
             
-            // SCO bağlantısı kur
+            // Establish SCO connection
             sco_connect();
             
             set_call_state(CALL_OUTGOING);
             hfp_listen_paused = FALSE;
             return TRUE;
         } else if (strstr(buf, "ERROR") || strstr(buf, "NO CARRIER")) {
-            log_msg("⚠️ Telefon aramayı reddetti");
+            log_msg("⚠️ Phone rejected call");
             hfp_listen_paused = FALSE;
             return FALSE;
         } else {
-            log_msg("⚠️ Bilinmeyen yanıt, yine de deneniyor...");
-            // Bilinmeyen yanıtta da dene
+            log_msg("⚠️ Unknown response, trying anyway...");
+            // Try even with unknown response
             sco_connect();
             set_call_state(CALL_OUTGOING);
             hfp_listen_paused = FALSE;
@@ -2653,72 +2687,72 @@ static gboolean hfp_dial(const char *number) {
         }
     }
     
-    // Dinleyici yoksa yeni bağlantı kur
+    // If no listener, establish new connection
     hfp_close();
     
-    // RFCOMM soketi oluştur
+    // Create RFCOMM socket
     hfp_socket = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
     if (hfp_socket < 0) {
-        log_msg("⚠️ RFCOMM soket hatası");
+        log_msg("⚠️ RFCOMM socket error");
         return FALSE;
     }
     
-    // Bağlantı adresi
+    // Connection address
     struct sockaddr_rc addr = {0};
     addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dinamik veya varsayılan
+    addr.rc_channel = hfp_channel ? hfp_channel : 3;  // Dynamic or default
     str2ba(device_addr, &addr.rc_bdaddr);
     
-    // Bağlan
-    log_msg("📱 HFP bağlantısı kuruluyor...");
+    // Connect
+    log_msg("📱 Establishing HFP connection...");
     if (connect(hfp_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(hfp_socket);
         hfp_socket = -1;
-        log_msg("⚠️ HFP bağlantısı kurulamadı");
+        log_msg("⚠️ HFP connection failed");
         return FALSE;
     }
     
-    log_msg("✓ HFP bağlantısı kuruldu");
+    log_msg("✓ HFP connection established");
     
     char cmd[128];
     char buf[512];
     int n;
     
     // HFP SLC (Service Level Connection) Handshake
-    // 1. AT+BRSF - Özellik değişimi
+    // 1. AT+BRSF - Feature exchange
     snprintf(cmd, sizeof(cmd), "AT+BRSF=0\r");
     if (write(hfp_socket, cmd, strlen(cmd)) < 0) goto error;
     usleep(100000);
     memset(buf, 0, sizeof(buf));
     n = read(hfp_socket, buf, sizeof(buf) - 1);
     if (n <= 0 || !strstr(buf, "OK")) {
-        log_msg("⚠️ AT+BRSF hatası");
+        log_msg("⚠️ AT+BRSF error");
         goto error;
     }
     
-    // 2. AT+CIND=? - Gösterge desteğini sor
+    // 2. AT+CIND=? - Ask indicator support
     snprintf(cmd, sizeof(cmd), "AT+CIND=?\r");
     if (write(hfp_socket, cmd, strlen(cmd)) < 0) goto error;
     usleep(100000);
     memset(buf, 0, sizeof(buf));
     n = read(hfp_socket, buf, sizeof(buf) - 1);
     if (n <= 0 || !strstr(buf, "OK")) {
-        log_msg("⚠️ AT+CIND=? hatası");
+        log_msg("⚠️ AT+CIND=? error");
         goto error;
     }
     
-    // 3. AT+CIND? - Gösterge durumunu al
+    // 3. AT+CIND? - Get indicator status
     snprintf(cmd, sizeof(cmd), "AT+CIND?\r");
     if (write(hfp_socket, cmd, strlen(cmd)) < 0) goto error;
     usleep(100000);
     memset(buf, 0, sizeof(buf));
     n = read(hfp_socket, buf, sizeof(buf) - 1);
     if (n <= 0 || !strstr(buf, "OK")) {
-        log_msg("⚠️ AT+CIND? hatası");
+        log_msg("⚠️ AT+CIND? error");
         goto error;
     }
     
-    // 4. AT+CMER - Olay raporlamayı etkinleştir
+    // 4. AT+CMER - Enable event reporting
     snprintf(cmd, sizeof(cmd), "AT+CMER=3,0,0,1\r");
     if (write(hfp_socket, cmd, strlen(cmd)) < 0) goto error;
     usleep(100000);
@@ -2732,33 +2766,33 @@ static gboolean hfp_dial(const char *number) {
         read(hfp_socket, buf, sizeof(buf) - 1);
     }
     
-    log_msg("✓ HFP SLC kuruldu");
+    log_msg("✓ HFP SLC established");
     
-    // 5. AT+NREC=0 - Noise reduction kapatma (isteğe bağlı)
+    // 5. AT+NREC=0 - Disable noise reduction (optional)
     snprintf(cmd, sizeof(cmd), "AT+NREC=0\r");
     write(hfp_socket, cmd, strlen(cmd));
     usleep(100000);
     memset(buf, 0, sizeof(buf));
     read(hfp_socket, buf, sizeof(buf) - 1);
     
-    // 6. ATD ile arama başlat
+    // 6. Start call with ATD
     snprintf(cmd, sizeof(cmd), "ATD%s;\r", number);
     if (write(hfp_socket, cmd, strlen(cmd)) < 0) goto error;
     
-    // Yanıtı bekle
+    // Wait for response
     usleep(1000000);
     memset(buf, 0, sizeof(buf));
     n = read(hfp_socket, buf, sizeof(buf) - 1);
     
     if (n > 0 && strstr(buf, "OK")) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "✓ Arama başlatıldı: %s", number);
+        snprintf(msg, sizeof(msg), "✓ Call started: %s", number);
         log_msg(msg);
         
-        // 7. SCO audio bağlantısı kur - ses PC'ye gelsin
+        // 7. Establish SCO audio connection - audio to PC
         sco_connect();
         
-        // 8. BlueZ üzerinden HFP audio profile'ı bağla (yedek)
+        // 8. Connect HFP audio profile via BlueZ (backup)
         if (device_path[0] && dbus_conn) {
             GError *error = NULL;
             // HFP Handsfree UUID
@@ -2769,7 +2803,7 @@ static gboolean hfp_dial(const char *number) {
                 NULL, G_DBUS_CALL_FLAGS_NONE, 5000, NULL, &error);
             if (error) {
                 g_error_free(error);
-                // Alternatif: HSP UUID dene
+                // Alternative: Try HSP UUID
                 g_dbus_connection_call_sync(
                     dbus_conn, "org.bluez", device_path,
                     "org.bluez.Device1", "ConnectProfile",
@@ -2778,7 +2812,7 @@ static gboolean hfp_dial(const char *number) {
             }
         }
         
-        // Monitor thread'i başlat - socket'i açık tutar
+        // Start monitor thread - keeps socket open
         hfp_monitor_running = TRUE;
         hfp_monitor_thread_handle = g_thread_new("hfp_monitor", hfp_monitor_thread, NULL);
         
@@ -2786,11 +2820,11 @@ static gboolean hfp_dial(const char *number) {
     } else {
         char msg[256];
         if (n > 0 && strstr(buf, "ERROR")) {
-            snprintf(msg, sizeof(msg), "⚠️ Telefon aramayı reddetti");
+            snprintf(msg, sizeof(msg), "⚠️ Phone rejected call");
         } else if (n > 0 && strstr(buf, "NO CARRIER")) {
-            snprintf(msg, sizeof(msg), "⚠️ Bağlantı kesildi");
+            snprintf(msg, sizeof(msg), "⚠️ Connection lost");
         } else {
-            snprintf(msg, sizeof(msg), "⚠️ Arama yanıtı: %s", n > 0 ? buf : "(boş)");
+            snprintf(msg, sizeof(msg), "⚠️ Call response: %s", n > 0 ? buf : "(empty)");
         }
         log_msg(msg);
         goto error;
@@ -2803,25 +2837,25 @@ error:
 
 static void dial_number(const char *number) {
     if (!number || !*number) {
-        log_msg("⚠️ Numara boş");
+        log_msg("⚠️ Number empty");
         return;
     }
     if (current_state != STATE_CONNECTED) {
-        log_msg("⚠️ Arama için telefon bağlı olmalı");
+        log_msg("⚠️ Phone must be connected for call");
         return;
     }
     
     char msg[256];
-    snprintf(msg, sizeof(msg), "📞 Aranıyor: %s", number);
+    snprintf(msg, sizeof(msg), "📞 Calling: %s", number);
     log_msg(msg);
     
-    // HFP ile arama dene
+    // Try HFP call
     if (hfp_dial(number)) {
-        // Başarılı - call state güncelle
+        // Success - update call state
         strncpy(current_call_number, number, sizeof(current_call_number) - 1);
-        current_call_name[0] = '\0';  // İsim rehberden bulunabilir
+        current_call_name[0] = '\0';  // Name can be found from contacts
         
-        // Rehberden isim bul
+        // Find name from contacts
         for (int i = 0; i < all_contacts_count; i++) {
             if (strcmp(all_contacts[i].number, number) == 0) {
                 strncpy(current_call_name, all_contacts[i].name, sizeof(current_call_name) - 1);
@@ -2832,11 +2866,11 @@ static void dial_number(const char *number) {
         set_call_state(CALL_OUTGOING);
         update_ui();
     } else {
-        // HFP başarısız, panoya kopyala
+        // HFP failed, copy to clipboard
         GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
         gtk_clipboard_set_text(clipboard, number, -1);
         
-        snprintf(msg, sizeof(msg), "📋 %s panoya kopyalandı", number);
+        snprintf(msg, sizeof(msg), "📋 %s copied to clipboard", number);
         log_msg(msg);
         
         GtkWidget *dialog = gtk_message_dialog_new(
@@ -2847,14 +2881,14 @@ static void dial_number(const char *number) {
             "📞 %s", number);
         gtk_message_dialog_format_secondary_text(
             GTK_MESSAGE_DIALOG(dialog),
-            "HFP bağlantısı kurulamadı.\nNumara panoya kopyalandı.");
-        gtk_window_set_title(GTK_WINDOW(dialog), "Arama");
+            "HFP connection failed.\nNumber copied to clipboard.");
+        gtk_window_set_title(GTK_WINDOW(dialog), "Call");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
     }
 }
 
-// Son görüşmelerde satıra çift tıklandığında
+// When double-clicked on recent calls row
 static void on_recent_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
                                     GtkTreeViewColumn *column, gpointer data) {
     (void)column; (void)data;
@@ -2864,7 +2898,7 @@ static void on_recent_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
     
     if (gtk_tree_model_get_iter(model, &iter, path)) {
         gchar *number = NULL;
-        gtk_tree_model_get(model, &iter, 2, &number, -1);  // Sütun 2: Numara
+        gtk_tree_model_get(model, &iter, 2, &number, -1);  // Column 2: Number
         
         if (number && *number) {
             dial_number(number);
@@ -2872,30 +2906,29 @@ static void on_recent_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
         }
     }
 }
-
-// Sağ tık menüsünden numarayı kopyala
+// Copy number from right-click menu
 static void on_copy_number_activate(GtkMenuItem *menuitem, gpointer data) {
     (void)menuitem;
     const char *number = (const char *)data;
     if (number && *number) {
         GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
         gtk_clipboard_set_text(clipboard, number, -1);
-        log_msg("📋 Numara kopyalandı");
+        log_msg("📋 Number copied");
     }
 }
 
-// Rehber sağ tık menüsü
+// Recent calls right-click menu
 static gboolean on_recents_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     (void)data;
     
-    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Sağ tık
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Right click
         GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
         GtkTreePath *path = NULL;
         
-        // Tıklanan satırı bul
+        // Find clicked row
         if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y,
                                           &path, NULL, NULL, NULL)) {
-            // Satırı seç
+            // Select row
             GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
             gtk_tree_selection_select_path(selection, path);
             
@@ -2905,16 +2938,16 @@ static gboolean on_recents_button_press(GtkWidget *widget, GdkEventButton *event
             if (gtk_tree_model_get_iter(model, &iter, path)) {
                 static gchar copied_number[64];
                 gchar *number = NULL;
-                gtk_tree_model_get(model, &iter, 2, &number, -1);  // Sütun 2: Numara
+                gtk_tree_model_get(model, &iter, 2, &number, -1);  // Column 2: Number
                 
                 if (number && *number) {
                     strncpy(copied_number, number, sizeof(copied_number) - 1);
                     copied_number[sizeof(copied_number) - 1] = '\0';
                     g_free(number);
                     
-                    // Popup menü oluştur
+                    // Create popup menu
                     GtkWidget *menu = gtk_menu_new();
-                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Numarayı Kopyala");
+                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Copy Number");
                     g_signal_connect(copy_item, "activate", G_CALLBACK(on_copy_number_activate), copied_number);
                     gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy_item);
                     gtk_widget_show_all(menu);
@@ -2924,7 +2957,7 @@ static gboolean on_recents_button_press(GtkWidget *widget, GdkEventButton *event
             }
             gtk_tree_path_free(path);
         }
-        return TRUE;  // Event işlendi
+        return TRUE;  // Event handled
     }
     return FALSE;
 }
@@ -2932,14 +2965,14 @@ static gboolean on_recents_button_press(GtkWidget *widget, GdkEventButton *event
 static gboolean on_contacts_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     (void)data;
     
-    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Sağ tık
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {  // Right click
         GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
         GtkTreePath *path = NULL;
         
-        // Tıklanan satırı bul
+        // Find clicked row
         if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y,
                                           &path, NULL, NULL, NULL)) {
-            // Satırı seç
+            // Select row
             GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
             gtk_tree_selection_select_path(selection, path);
             
@@ -2956,9 +2989,9 @@ static gboolean on_contacts_button_press(GtkWidget *widget, GdkEventButton *even
                     copied_number[sizeof(copied_number) - 1] = '\0';
                     g_free(number);
                     
-                    // Popup menü oluştur
+                    // Create popup menu
                     GtkWidget *menu = gtk_menu_new();
-                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Numarayı Kopyala");
+                    GtkWidget *copy_item = gtk_menu_item_new_with_label("📋 Copy Number");
                     g_signal_connect(copy_item, "activate", G_CALLBACK(on_copy_number_activate), copied_number);
                     gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy_item);
                     gtk_widget_show_all(menu);
@@ -2968,12 +3001,12 @@ static gboolean on_contacts_button_press(GtkWidget *widget, GdkEventButton *even
             }
             gtk_tree_path_free(path);
         }
-        return TRUE;  // Event işlendi
+        return TRUE;  // Event handled
     }
     return FALSE;
 }
 
-// Rehberde satıra çift tıklandığında
+// When double-clicked on contact row
 static void on_contact_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
                                      GtkTreeViewColumn *column, gpointer data) {
     (void)column; (void)data;
@@ -2983,7 +3016,7 @@ static void on_contact_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
     
     if (gtk_tree_model_get_iter(model, &iter, path)) {
         gchar *number = NULL;
-        gtk_tree_model_get(model, &iter, 1, &number, -1);  // Sütun 1: Numara
+        gtk_tree_model_get(model, &iter, 1, &number, -1);  // Column 1: Number
         
         if (number && *number) {
             dial_number(number);
@@ -3001,8 +3034,8 @@ static void update_call_ui(void) {
 
     switch (current_call_state) {
         case CALL_IDLE:
-            snprintf(call_text, sizeof(call_text), "📞 Arama yok");
-            // Keep above ve urgency hint'i kapat
+            snprintf(call_text, sizeof(call_text), "📞 No call");
+            // Disable keep above and urgency hint
             if (window) {
                 gtk_window_set_keep_above(GTK_WINDOW(window), FALSE);
                 gtk_window_set_urgency_hint(GTK_WINDOW(window), FALSE);
@@ -3011,35 +3044,35 @@ static void update_call_ui(void) {
         case CALL_RINGING:
             if (current_call_name[0] && current_call_number[0]) {
                 snprintf(call_text, sizeof(call_text), 
-                    "🔔 GELEN ARAMA\n\n%s\n%s",
+                    "🔔 INCOMING CALL\n\n%s\n%s",
                     current_call_name, current_call_number);
             } else if (current_call_number[0]) {
                 snprintf(call_text, sizeof(call_text), 
-                    "🔔 GELEN ARAMA\n\n%s",
+                    "🔔 INCOMING CALL\n\n%s",
                     current_call_number);
             } else {
-                snprintf(call_text, sizeof(call_text), "🔔 GELEN ARAMA");
+                snprintf(call_text, sizeof(call_text), "🔔 INCOMING CALL");
             }
             break;
         case CALL_OUTGOING:
             if (current_call_name[0]) {
                 snprintf(call_text, sizeof(call_text), 
-                    "📱 Aranıyor...\n\n%s\n%s",
+                    "📱 Calling...\n\n%s\n%s",
                     current_call_name, current_call_number);
             } else {
                 snprintf(call_text, sizeof(call_text), 
-                    "📱 Aranıyor...\n\n%s",
+                    "📱 Calling...\n\n%s",
                     current_call_number);
             }
             break;
         case CALL_ACTIVE:
             if (current_call_name[0]) {
                 snprintf(call_text, sizeof(call_text), 
-                    "✅ Görüşme Aktif\n\n%s\n%s",
+                    "✅ Call Active\n\n%s\n%s",
                     current_call_name, current_call_number);
             } else {
                 snprintf(call_text, sizeof(call_text), 
-                    "✅ Görüşme Aktif\n\n%s",
+                    "✅ Call Active\n\n%s",
                     current_call_number);
             }
             break;
@@ -3047,13 +3080,12 @@ static void update_call_ui(void) {
 
     gtk_label_set_markup(GTK_LABEL(call_status_label), call_text);
 
-    // Gelen arama: Cevapla/Reddet aktif
-    // Giden arama: Bitir aktif
-    // Aktif görüşme: Bitir aktif
+    // Incoming call: Answer/Reject active
+    // Outgoing call: Hangup active
+    // Active call: Hangup active
     gtk_widget_set_sensitive(answer_btn, current_call_state == CALL_RINGING);
     gtk_widget_set_sensitive(reject_btn, current_call_state == CALL_RINGING);
     gtk_widget_set_sensitive(hangup_btn, current_call_state == CALL_ACTIVE || current_call_state == CALL_OUTGOING);
-    gtk_widget_set_sensitive(test_call_btn, current_call_state == CALL_IDLE);
 }
 
 static void set_call_state(CallState new_state) {
@@ -3089,9 +3121,9 @@ static void set_state(AppState new_state) {
     AppState old_state = current_state;
     current_state = new_state;
     
-    // CONNECTED olduğunda arka planda veri yüklemeyi başlat
+    // Start background data loading when CONNECTED
     if (new_state == STATE_CONNECTED && old_state != STATE_CONNECTED) {
-        // HFP kanalını SDP ile bul (henüz bulunmamışsa)
+        // Find HFP channel via SDP (if not found yet)
         if (hfp_channel == 0 && device_addr[0]) {
             uint8_t ch = find_hfp_channel(device_addr);
             if (ch) {
@@ -3099,19 +3131,19 @@ static void set_state(AppState new_state) {
             }
         }
         
-        // Gelen arama dinleyiciyi başlat
+        // Start incoming call listener
         start_incoming_call_listener();
         
-        // Rehberi arka planda yükle (henüz yüklenmemişse)
-        // Son aramalar rehber yüklendikten sonra otomatik başlayacak
+        // Load phonebook in background (if not loaded yet)
+        // Recent calls will start automatically after phonebook is loaded
         if (!phonebook_loaded && !syncing_contacts) {
             syncing_contacts = TRUE;
-            log_msg("📥 Veriler arka planda yükleniyor...");
+            log_msg("📥 Loading data in background...");
             g_thread_new("preload_phonebook", load_phonebook_thread, NULL);
         }
     }
     
-    // CONNECTED'dan çıkarken tüm bağlantıları temizle
+    // Clean up all connections when leaving CONNECTED
     if (old_state == STATE_CONNECTED && new_state != STATE_CONNECTED) {
         cleanup_connection(NULL, FALSE);
     }
@@ -3124,58 +3156,58 @@ static void update_ui(void) {
 
     switch (current_state) {
         case STATE_IDLE:
-            snprintf(status_text, sizeof(status_text), "🔵 Hazır");
+            snprintf(status_text, sizeof(status_text), "🔵 Ready");
             snprintf(info_text, sizeof(info_text),
-                     "PC pasif modda.\n\n"
-                     "'Başlat' butonuna basınca keşfedilebilir olur.\n"
-                     "Telefonunuzdan bu PC'yi bulup bağlanın.");
+                     "PC in passive mode.\n\n"
+                     "Press 'Start' to become discoverable.\n"
+                     "Connect from your phone.");
             css_class = "status-idle";
             break;
         case STATE_DISCOVERABLE:
-            snprintf(status_text, sizeof(status_text), "📡 Keşfedilebilir - Telefon bekleniyor");
+            snprintf(status_text, sizeof(status_text), "📡 Discoverable - Waiting for phone");
             snprintf(info_text, sizeof(info_text),
-                     "Telefonunuzda Bluetooth taraması yapın\n"
-                     "ve bu PC'ye bağlanın.\n\n"
-                     "Eşleştirme ve bağlantı otomatik kabul edilir.");
+                     "Scan for Bluetooth on your phone\n"
+                     "and connect to this PC.\n\n"
+                     "Pairing and connection are auto-accepted.");
             css_class = "status-discoverable";
             break;
         case STATE_PAIRING:
-            snprintf(status_text, sizeof(status_text), "🔗 Eşleştirme yapılıyor");
+            snprintf(status_text, sizeof(status_text), "🔗 Pairing");
             snprintf(info_text, sizeof(info_text),
-                     "Telefondan eşleştirme isteği geldi.\n"
-                     "Otomatik onaylandı.");
+                     "Pairing request from phone.\n"
+                     "Auto-approved.");
             css_class = "status-pairing";
             break;
         case STATE_PAIRED:
-            snprintf(status_text, sizeof(status_text), "✓ Eşleştirildi");
+            snprintf(status_text, sizeof(status_text), "✓ Paired");
             snprintf(info_text, sizeof(info_text),
-                     "Cihaz: %s\nAdres: %s\n\n"
-                     "Otomatik bağlanma deneniyor...",
-                     device_name[0] ? device_name : "Bilinmiyor",
+                     "Device: %s\nAddress: %s\n\n"
+                     "Trying auto-connect...",
+                     device_name[0] ? device_name : "Unknown",
                      device_addr[0] ? device_addr : "-" );
             css_class = "status-paired";
             break;
         case STATE_CONNECTING:
-            snprintf(status_text, sizeof(status_text), "🔗 Bağlanıyor");
+            snprintf(status_text, sizeof(status_text), "🔗 Connecting");
             snprintf(info_text, sizeof(info_text),
-                     "Cihaz: %s\nAdres: %s\n\n"
-                     "Bağlantı kuruluyor...",
-                     device_name[0] ? device_name : "Bilinmiyor",
+                     "Device: %s\nAddress: %s\n\n"
+                     "Establishing connection...",
+                     device_name[0] ? device_name : "Unknown",
                      device_addr[0] ? device_addr : "-" );
             css_class = "status-connecting";
             break;
         case STATE_CONNECTED:
-            snprintf(status_text, sizeof(status_text), "✅ BAĞLI");
+            snprintf(status_text, sizeof(status_text), "✅ CONNECTED");
             snprintf(info_text, sizeof(info_text),
-                     "Cihaz: %s\nAdres: %s\n\n"
-                     "Telefon bu PC'yi kulaklık olarak kullanıyor.",
-                     device_name[0] ? device_name : "Bilinmiyor",
+                     "Device: %s\nAddress: %s\n\n"
+                     "Phone is using this PC as headset.",
+                     device_name[0] ? device_name : "Unknown",
                      device_addr[0] ? device_addr : "-" );
             css_class = "status-connected";
             break;
         case STATE_ERROR:
-            snprintf(status_text, sizeof(status_text), "❌ HATA");
-            snprintf(info_text, sizeof(info_text), "Hata: %s", error_msg);
+            snprintf(status_text, sizeof(status_text), "❌ ERROR");
+            snprintf(info_text, sizeof(info_text), "Error: %s", error_msg);
             css_class = "status-error";
             break;
     }
@@ -3224,7 +3256,7 @@ static gboolean set_adapter_property(const char *prop, GVariant *value) {
         NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
 
     if (error) {
-        snprintf(error_msg, sizeof(error_msg), "Adapter ayarı hatası (%s): %s", prop, error->message);
+        snprintf(error_msg, sizeof(error_msg), "Adapter setting error (%s): %s", prop, error->message);
         log_msg(error_msg);
         g_error_free(error);
         return FALSE;
@@ -3240,9 +3272,9 @@ static void make_discoverable(gboolean discoverable) {
     if (discoverable) {
         set_adapter_property("DiscoverableTimeout", g_variant_new_uint32(0));
         set_adapter_property("PairableTimeout", g_variant_new_uint32(0));
-        log_msg("✓ PC keşfedilebilir yapıldı");
+        log_msg("✓ PC made discoverable");
     } else {
-        log_msg("✓ Keşfedilebilirlik kapatıldı");
+        log_msg("✓ Discoverability disabled");
     }
 }
 
@@ -3301,25 +3333,25 @@ static void agent_method_call(GDBusConnection *conn, const gchar *sender,
     }
 
     if (g_strcmp0(method_name, "RequestPinCode") == 0) {
-        log_msg("Agent: PIN isteniyor (0000)");
+        log_msg("Agent: PIN requested (0000)");
         g_dbus_method_invocation_return_value(invocation, g_variant_new("(s)", "0000"));
         return;
     }
 
     if (g_strcmp0(method_name, "DisplayPinCode") == 0) {
-        log_msg("Agent: PIN gösterimi");
+        log_msg("Agent: PIN display");
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
 
     if (g_strcmp0(method_name, "RequestPasskey") == 0) {
-        log_msg("Agent: Passkey isteniyor (0)");
+        log_msg("Agent: Passkey requested (0)");
         g_dbus_method_invocation_return_value(invocation, g_variant_new("(u)", 0));
         return;
     }
 
     if (g_strcmp0(method_name, "DisplayPasskey") == 0) {
-        log_msg("Agent: Passkey gösterimi");
+        log_msg("Agent: Passkey display");
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
@@ -3330,7 +3362,7 @@ static void agent_method_call(GDBusConnection *conn, const gchar *sender,
         g_variant_get(parameters, "(&ou)", &device, &passkey);
 
         char msg[128];
-        snprintf(msg, sizeof(msg), "🔔 Eşleştirme isteği: %06u", passkey);
+        snprintf(msg, sizeof(msg), "🔔 Pairing request: %06u", passkey);
         log_msg(msg);
 
         strncpy(device_path, device, sizeof(device_path) - 1);
@@ -3340,25 +3372,25 @@ static void agent_method_call(GDBusConnection *conn, const gchar *sender,
             g_idle_add((GSourceFunc)update_ui, NULL);
         }
 
-        // Otomatik onay
+        // Auto approve
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
 
     if (g_strcmp0(method_name, "RequestAuthorization") == 0) {
-        log_msg("Agent: Yetkilendirme (otomatik kabul)");
+        log_msg("Agent: Authorization (auto accept)");
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
 
     if (g_strcmp0(method_name, "AuthorizeService") == 0) {
-        log_msg("Agent: Servis yetkilendirme (otomatik kabul)");
+        log_msg("Agent: Service authorization (auto accept)");
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
 
     if (g_strcmp0(method_name, "Cancel") == 0) {
-        log_msg("Agent: İptal edildi");
+        log_msg("Agent: Cancelled");
         set_state(STATE_DISCOVERABLE);
         g_idle_add((GSourceFunc)update_ui, NULL);
         g_dbus_method_invocation_return_value(invocation, NULL);
@@ -3378,7 +3410,7 @@ static gboolean register_agent(void) {
 
     agent_introspection = g_dbus_node_info_new_for_xml(agent_xml, &error);
     if (error) {
-        snprintf(error_msg, sizeof(error_msg), "Agent XML hatası: %s", error->message);
+        snprintf(error_msg, sizeof(error_msg), "Agent XML error: %s", error->message);
         g_error_free(error);
         return FALSE;
     }
@@ -3391,7 +3423,7 @@ static gboolean register_agent(void) {
         NULL, NULL, &error);
 
     if (error) {
-        snprintf(error_msg, sizeof(error_msg), "Agent kayıt hatası: %s", error->message);
+        snprintf(error_msg, sizeof(error_msg), "Agent registration error: %s", error->message);
         g_error_free(error);
         return FALSE;
     }
@@ -3404,7 +3436,7 @@ static gboolean register_agent(void) {
 
     if (error) {
         if (!strstr(error->message, "Already Exists")) {
-            snprintf(error_msg, sizeof(error_msg), "Agent tanıtma hatası: %s", error->message);
+            snprintf(error_msg, sizeof(error_msg), "Agent introduction error: %s", error->message);
             g_error_free(error);
             return FALSE;
         }
@@ -3425,7 +3457,7 @@ static gboolean register_agent(void) {
         g_variant_unref(result);
     }
 
-    log_msg("✓ Agent kaydedildi");
+    log_msg("✓ Agent registered");
     return TRUE;
 }
 
@@ -3439,10 +3471,10 @@ static gboolean connect_complete_cb(gpointer data) {
 
     if (success) {
         set_state(STATE_CONNECTED);
-        log_msg("✅ Otomatik bağlantı kuruldu");
+        log_msg("✅ Auto connection established");
     } else {
         set_state(STATE_PAIRED);
-        log_msg("⚠️ Otomatik bağlantı başarısız, telefon bağlanabilir");
+        log_msg("⚠️ Auto connection failed, phone can connect");
     }
 
     update_ui();
@@ -3519,26 +3551,26 @@ static gboolean parse_ciev(const char *buf, int *indicator, int *value) {
 static void stop_sco_audio(const char *reason) {
     gboolean was_running = sco_audio_running || (sco_socket >= 0);
 
-    // Önce flag'i kapat ki thread'ler döngüden çıksın
+    // Close flag first so threads exit loop
     sco_audio_running = FALSE;
     
-    // Thread'lerin döngüden çıkması için kısa bekle
+    // Short wait for threads to exit loop
     usleep(50000);  // 50ms
     
-    // Socket'i kapat
+    // Close socket
     if (sco_socket >= 0) {
         shutdown(sco_socket, SHUT_RDWR);
         close(sco_socket);
         sco_socket = -1;
     }
     
-    // Thread'lerin tamamen bitmesini bekle (max 500ms)
+    // Wait for threads to fully exit (max 500ms)
     for (int i = 0; i < 10 && (pulse_playback || pulse_capture); i++) {
         usleep(50000);  // 50ms
     }
 
     if (reason && was_running) {
-        // Thread-safe log (arka plan thread'inden çağrılabilir)
+        // Thread-safe log (can be called from background thread)
         g_idle_add((GSourceFunc)lambda_log, g_strdup(reason));
     }
 
@@ -3550,7 +3582,7 @@ static void clear_device_info(void) {
     device_addr[0] = '\0';
     device_name[0] = '\0';
     device_paired = FALSE;
-    hfp_channel = 0;  // HFP kanalını sıfırla
+    hfp_channel = 0;  // Reset HFP channel
 }
 
 static void cleanup_connection(const char *reason, gboolean clear_device) {
@@ -3579,7 +3611,7 @@ static void handle_incoming_call(const char *number) {
         strncpy(current_call_name, name, sizeof(current_call_name) - 1);
     }
 
-    log_msg("📞 Gelen arama algılandı");
+    log_msg("📞 Incoming call detected");
     set_call_state(CALL_RINGING);
     update_ui();
 }
@@ -3587,10 +3619,10 @@ static void handle_incoming_call(const char *number) {
 static void on_answer_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
 
-    log_msg("✅ Arama cevaplandı");
+    log_msg("✅ Call answered");
 
     if (current_call_state != CALL_RINGING) {
-        log_msg("⚠️ Cevapla: Geçersiz durumda");
+        log_msg("⚠️ Answer: Invalid state");
         return;
     }
 
@@ -3606,26 +3638,25 @@ static void on_answer_clicked(GtkWidget *widget, gpointer data) {
         }
     }
 
-    // SCO bağlantısı kur
+    // Establish SCO connection
     sco_connect();
 
     set_call_state(CALL_ACTIVE);
     update_ui();
 }
-
 static void on_reject_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
-    log_msg("❌ Arama reddedildi");
+    log_msg("❌ Call rejected");
 
     if (current_call_state != CALL_RINGING && current_call_state != CALL_OUTGOING) {
-        log_msg("⚠️ Reddet: Geçersiz durumda");
+        log_msg("⚠️ Reject: Invalid state");
         return;
     }
 
     gtk_widget_set_sensitive(reject_btn, FALSE);
     gtk_widget_set_sensitive(hangup_btn, FALSE);
     
-    // Gelen arama ise
+    // Incoming call
     if (current_call_state == CALL_RINGING && hfp_listen_socket >= 0) {
         char cmd[] = "AT+CHUP\r";
         if (write(hfp_listen_socket, cmd, strlen(cmd)) > 0) {
@@ -3636,17 +3667,17 @@ static void on_reject_clicked(GtkWidget *widget, gpointer data) {
         set_call_state(CALL_IDLE);
         clear_call_info();
     }
-    // Giden arama - listen socket üzerinden yapıldıysa
+    // Outgoing call - if done via listen socket
     else if (current_call_state == CALL_OUTGOING && hfp_listen_socket >= 0) {
-        log_msg("📱 Giden arama iptal ediliyor...");
+        log_msg("📱 Canceling outgoing call...");
         char cmd[] = "AT+CHUP\r";
         if (write(hfp_listen_socket, cmd, strlen(cmd)) > 0) {
             usleep(200000);
             char buf[256] = {0};
             read(hfp_listen_socket, buf, sizeof(buf) - 1);
-            log_msg("📱 AT+CHUP gönderildi");
+            log_msg("📱 AT+CHUP sent");
         }
-        // SCO'yu kapat
+        // Close SCO
         sco_audio_running = FALSE;
         if (sco_socket >= 0) {
             shutdown(sco_socket, SHUT_RDWR);
@@ -3656,7 +3687,7 @@ static void on_reject_clicked(GtkWidget *widget, gpointer data) {
         set_call_state(CALL_IDLE);
         clear_call_info();
     }
-    // Giden arama - hfp_socket üzerinden
+    // Outgoing call - via hfp_socket
     else if (current_call_state == CALL_OUTGOING && hfp_socket >= 0) {
         hfp_hangup();
     } else {
@@ -3667,34 +3698,34 @@ static void on_reject_clicked(GtkWidget *widget, gpointer data) {
 
 static void on_hangup_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
-    log_msg("🔚 Görüşme bitirildi");
+    log_msg("🔚 Call ended");
 
     if (current_call_state != CALL_OUTGOING && current_call_state != CALL_ACTIVE) {
-        log_msg("⚠️ Bitir: Geçersiz durumda");
+        log_msg("⚠️ Hangup: Invalid state");
         return;
     }
 
     gtk_widget_set_sensitive(reject_btn, FALSE);
     gtk_widget_set_sensitive(hangup_btn, FALSE);
 
-    // SCO'yu arka planda kapat (UI donmasın)
+    // Close SCO in background (to avoid UI freeze)
     sco_audio_running = FALSE;
     
-    // Gelen arama görüşmesi (listen socket üzerinden)
+    // Incoming call (via listen socket)
     if (hfp_listen_socket >= 0) {
         char cmd[] = "AT+CHUP\r";
         write(hfp_listen_socket, cmd, strlen(cmd));
-        log_msg("📱 AT+CHUP gönderildi (listen)");
+        log_msg("📱 AT+CHUP sent (listen)");
     }
-    // Giden arama (hfp_socket üzerinden)
+    // Outgoing call (via hfp_socket)
     else if (hfp_socket >= 0) {
         char cmd[] = "AT+CHUP\r";
         write(hfp_socket, cmd, strlen(cmd));
-        log_msg("📱 AT+CHUP gönderildi");
+        log_msg("📱 AT+CHUP sent");
     }
     
-    // SCO temizliğini arka planda yap
-    g_thread_new("hangup_cleanup", (GThreadFunc)stop_sco_audio, "🔊 SCO kapatıldı");
+    // Do SCO cleanup in background
+    g_thread_new("hangup_cleanup", (GThreadFunc)stop_sco_audio, "🔊 SCO closed");
     
     set_call_state(CALL_IDLE);
     clear_call_info();
@@ -3775,15 +3806,15 @@ static void on_properties_changed(GDBusConnection *conn, const gchar *sender,
             device_paired = is_paired;
             if (is_paired && is_same_device) {
                 get_device_info(path);
-                log_msg("✓ Eşleştirme tamamlandı");
+                log_msg("✓ Pairing completed");
                 if (current_state != STATE_CONNECTED) {
                     set_state(STATE_PAIRED);
                     g_idle_add((GSourceFunc)update_ui, NULL);
                     try_auto_connect();
                 }
             } else if (!is_paired && is_same_device) {
-                log_msg("🔓 Eşleştirme kaldırıldı");
-                cleanup_connection("📴 Cihaz ayrıldı", TRUE);
+                log_msg("🔓 Pairing removed");
+                cleanup_connection("📴 Device disconnected", TRUE);
                 set_state(current_state == STATE_IDLE ? STATE_IDLE : STATE_DISCOVERABLE);
                 g_idle_add((GSourceFunc)update_ui, NULL);
             }
@@ -3795,13 +3826,17 @@ static void on_properties_changed(GDBusConnection *conn, const gchar *sender,
             gboolean is_connected = g_variant_get_boolean(connected);
             if (is_connected && is_same_device) {
                 get_device_info(path);
-                log_msg("📱 Cihaz bağlandı");
+                log_msg("📱 Device connected");
+                
+                // Prevent PulseAudio from taking over SCO
+                system("pactl unload-module module-bluez5-device 2>/dev/null");
+                
                 auto_connect_in_progress = FALSE;
                 set_state(STATE_CONNECTED);
                 g_idle_add((GSourceFunc)update_ui, NULL);
             } else if (!is_connected && is_same_device) {
                 if (current_state == STATE_CONNECTED || current_state == STATE_CONNECTING) {
-                    cleanup_connection("📴 Bağlantı kesildi", FALSE);
+                    cleanup_connection("📴 Connection lost", FALSE);
                     set_state(device_paired ? STATE_PAIRED : STATE_DISCOVERABLE);
                     g_idle_add((GSourceFunc)update_ui, NULL);
                 }
@@ -3837,7 +3872,7 @@ static void on_interfaces_removed(GDBusConnection *conn, const gchar *sender,
         }
 
         if (removed) {
-            cleanup_connection("🗑️ Cihaz kaldırıldı", TRUE);
+            cleanup_connection("🗑️ Device removed", TRUE);
             set_state(current_state == STATE_IDLE ? STATE_IDLE : STATE_DISCOVERABLE);
             g_idle_add((GSourceFunc)update_ui, NULL);
         }
@@ -3869,7 +3904,7 @@ static void setup_dbus_signals(void) {
         on_interfaces_removed,
         NULL, NULL);
 
-    log_msg("✓ D-Bus sinyal dinleyici kuruldu");
+    log_msg("✓ D-Bus signal listener set up");
 }
 
 // ============================================================================
@@ -3907,7 +3942,7 @@ static void sync_initial_state(void) {
 
             if (connected && g_variant_get_boolean(connected)) {
                 get_device_info(path);
-                log_msg("ℹ️ Başlangıçta bağlı cihaz bulundu");
+                log_msg("ℹ️ Connected device found at startup");
                 set_state(STATE_CONNECTED);
                 g_variant_unref(connected);
                 if (paired) g_variant_unref(paired);
@@ -3932,7 +3967,7 @@ static void sync_initial_state(void) {
 
     if (found_paired) {
         get_device_info(paired_path);
-        log_msg("ℹ️ Başlangıçta eşleşmiş cihaz bulundu");
+        log_msg("ℹ️ Paired device found at startup");
         set_state(STATE_PAIRED);
     }
 
@@ -3962,13 +3997,13 @@ static void on_dial_call_clicked(GtkWidget *widget, gpointer data) {
     
     const gchar *number = gtk_entry_get_text(entry);
     if (!number || !*number) {
-        log_msg("⚠️ Numara girilmedi");
+        log_msg("⚠️ No number entered");
         return;
     }
     
     dial_number(number);
     
-    // Entry'yi temizle
+    // Clear entry
     gtk_entry_set_text(entry, "");
 }
 
@@ -3979,7 +4014,7 @@ static void on_dial_call_clicked(GtkWidget *widget, gpointer data) {
 static void on_start_clicked(GtkWidget *widget, gpointer data) {
     (void)widget; (void)data;
 
-    log_msg("🚀 Başlatılıyor...");
+    log_msg("🚀 Starting...");
 
     if (!register_agent()) {
         set_state(STATE_ERROR);
@@ -4014,7 +4049,7 @@ static void on_disconnect_clicked(GtkWidget *widget, gpointer data) {
             log_msg(error->message);
             g_error_free(error);
         } else {
-            log_msg("🔌 Bağlantı kesildi");
+            log_msg("🔌 Disconnected");
         }
     }
 
@@ -4032,12 +4067,12 @@ static gboolean init_dbus(void) {
 
     dbus_conn = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
     if (error) {
-        snprintf(error_msg, sizeof(error_msg), "D-Bus hatası: %s", error->message);
+        snprintf(error_msg, sizeof(error_msg), "D-Bus error: %s", error->message);
         g_error_free(error);
         return FALSE;
     }
 
-    log_msg("✓ D-Bus bağlantısı kuruldu");
+    log_msg("✓ D-Bus connection established");
     return TRUE;
 }
 
@@ -4049,7 +4084,7 @@ static void apply_css(void) {
     GtkCssProvider *provider = gtk_css_provider_new();
 
     const char *css =
-        /* Global - HER ŞEY koyu */
+        /* Global - EVERYTHING dark */
         "* { background-color: #161b22; color: #c9d1d9; }"
         "window { background: #0d1117; }"
         "box { background: transparent; }"
@@ -4064,7 +4099,7 @@ static void apply_css(void) {
         ".status-connected { color: #3fb950; font-weight: bold; }"
         ".status-error { color: #f85149; font-weight: bold; }"
         
-        /* Labels - tüm yazılar açık renk */
+        /* Labels - all text light */
         "label { color: #c9d1d9; background: transparent; }"
         ".info-label { color: #8b949e; font-size: 12px; }"
         ".call-label { color: #ffffff; font-size: 14px; }"
@@ -4131,7 +4166,7 @@ static void apply_css(void) {
 
 static void create_ui(void) {
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Bluetooth Kulaklık Simülatörü");
+    gtk_window_set_title(GTK_WINDOW(window), "Bluetooth Headset Simulator");
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 650);
     gtk_container_set_border_width(GTK_CONTAINER(window), 12);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
@@ -4140,96 +4175,97 @@ static void create_ui(void) {
     GtkWidget *main_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_add(GTK_CONTAINER(window), main_vbox);
 
-    // Üst bilgi alanı (kompakt)
+    // Header area (compact)
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(main_vbox), header_box, FALSE, FALSE, 0);
 
-    GtkWidget *title = gtk_label_new("🎧 BT Kulaklık");
+    GtkWidget *title = gtk_label_new("🎧 BT Headset");
     GtkStyleContext *ctx = gtk_widget_get_style_context(title);
     gtk_style_context_add_class(ctx, "title");
     gtk_box_pack_start(GTK_BOX(header_box), title, FALSE, FALSE, 0);
 
-    state_label = gtk_label_new("⚪ Hazır");
+    state_label = gtk_label_new("⚪ Ready");
     gtk_widget_set_halign(state_label, GTK_ALIGN_END);
     gtk_box_pack_end(GTK_BOX(header_box), state_label, FALSE, FALSE, 0);
 
     spinner = gtk_spinner_new();
     gtk_box_pack_end(GTK_BOX(header_box), spinner, FALSE, FALSE, 0);
 
-    // Kontrol butonları (kompakt)
+    // Control buttons (compact)
     GtkWidget *ctrl_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(main_vbox), ctrl_box, FALSE, FALSE, 0);
 
-    start_btn = gtk_button_new_with_label("▶ Başlat");
+    start_btn = gtk_button_new_with_label("▶ Start");
     ctx = gtk_widget_get_style_context(start_btn);
     gtk_style_context_add_class(ctx, "btn-start");
     g_signal_connect(start_btn, "clicked", G_CALLBACK(on_start_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), start_btn, TRUE, TRUE, 0);
 
-    stop_btn = gtk_button_new_with_label("⏹ Durdur");
+    stop_btn = gtk_button_new_with_label("⏹ Stop");
     ctx = gtk_widget_get_style_context(stop_btn);
     gtk_style_context_add_class(ctx, "btn-stop");
     g_signal_connect(stop_btn, "clicked", G_CALLBACK(on_stop_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), stop_btn, TRUE, TRUE, 0);
 
-    disconnect_btn = gtk_button_new_with_label("🔌 Kes");
+    disconnect_btn = gtk_button_new_with_label("🔌 Disconnect");
     g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), disconnect_btn, TRUE, TRUE, 0);
 
-    // Arama durumu
+    // Call status
     info_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(info_label), 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(info_label), "info-label");
     gtk_box_pack_start(GTK_BOX(main_vbox), info_label, FALSE, FALSE, 0);
 
-    call_status_label = gtk_label_new("📞 Arama yok");
-    gtk_label_set_xalign(GTK_LABEL(call_status_label), 0.5);  // Ortala
+    call_status_label = gtk_label_new("📞 No call");
+    gtk_label_set_xalign(GTK_LABEL(call_status_label), 0.5);  // Center
     gtk_label_set_use_markup(GTK_LABEL(call_status_label), TRUE);
     gtk_label_set_justify(GTK_LABEL(call_status_label), GTK_JUSTIFY_CENTER);
     gtk_style_context_add_class(gtk_widget_get_style_context(call_status_label), "call-label");
     gtk_box_pack_start(GTK_BOX(main_vbox), call_status_label, FALSE, FALSE, 4);
 
-    // Arama butonları
+    // Call buttons
     GtkWidget *call_btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(main_vbox), call_btn_box, FALSE, FALSE, 0);
 
-    answer_btn = gtk_button_new_with_label("✅ Cevapla");
+    answer_btn = gtk_button_new_with_label("✅ Answer");
     gtk_style_context_add_class(gtk_widget_get_style_context(answer_btn), "btn-answer");
     g_signal_connect(answer_btn, "clicked", G_CALLBACK(on_answer_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), answer_btn, TRUE, TRUE, 0);
 
-    reject_btn = gtk_button_new_with_label("❌ Reddet");
+    reject_btn = gtk_button_new_with_label("❌ Reject");
     gtk_style_context_add_class(gtk_widget_get_style_context(reject_btn), "btn-reject");
     g_signal_connect(reject_btn, "clicked", G_CALLBACK(on_reject_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), reject_btn, TRUE, TRUE, 0);
 
-    hangup_btn = gtk_button_new_with_label("🔚 Bitir");
+    hangup_btn = gtk_button_new_with_label("🔚 Hang up");
     gtk_style_context_add_class(gtk_widget_get_style_context(hangup_btn), "btn-reject");
     g_signal_connect(hangup_btn, "clicked", G_CALLBACK(on_hangup_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), hangup_btn, TRUE, TRUE, 0);
 
-    test_call_btn = gtk_button_new_with_label("📞 Test");
-    g_signal_connect(test_call_btn, "clicked", G_CALLBACK(on_test_call_clicked), NULL);
-    gtk_box_pack_start(GTK_BOX(call_btn_box), test_call_btn, TRUE, TRUE, 0);
+    GtkWidget *donate_btn = gtk_link_button_new_with_label(
+        "https://buymeacoffee.com/ancientcoder",
+        "❤️ Donate");
+    gtk_box_pack_start(GTK_BOX(call_btn_box), donate_btn, TRUE, TRUE, 0);
 
-    // ========== TAB YAPISI ==========
+    // ========== TAB STRUCTURE ==========
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
     gtk_box_pack_start(GTK_BOX(main_vbox), notebook, TRUE, TRUE, 0);
 
-    // ----- TAB 1: Tuş Takımı -----
+    // ----- TAB 1: Dialpad -----
     GtkWidget *dialpad_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(dialpad_page), 8);
     
     GtkWidget *dial_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(dial_entry), "Numara girin...");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(dial_entry), "Enter number...");
     gtk_entry_set_alignment(GTK_ENTRY(dial_entry), 0.5);
     gtk_widget_set_size_request(dial_entry, -1, 40);
     ctx = gtk_widget_get_style_context(dial_entry);
     gtk_style_context_add_class(ctx, "dial-entry");
     gtk_box_pack_start(GTK_BOX(dialpad_page), dial_entry, FALSE, FALSE, 0);
 
-    // Tuş takımı grid
+    // Dialpad grid
     GtkWidget *dialpad_grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(dialpad_grid), 6);
     gtk_grid_set_column_spacing(GTK_GRID(dialpad_grid), 6);
@@ -4247,7 +4283,7 @@ static void create_ui(void) {
         gtk_grid_attach(GTK_GRID(dialpad_grid), btn, i % 3, i / 3, 1, 1);
     }
 
-    GtkWidget *call_btn = gtk_button_new_with_label("📞 Ara");
+    GtkWidget *call_btn = gtk_button_new_with_label("📞 Call");
     gtk_widget_set_size_request(call_btn, 220, 50);
     ctx = gtk_widget_get_style_context(call_btn);
     gtk_style_context_add_class(ctx, "btn-start");
@@ -4256,20 +4292,20 @@ static void create_ui(void) {
     gtk_box_pack_start(GTK_BOX(dialpad_page), call_btn, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), dialpad_page, 
-                             gtk_label_new("📱 Tuş Takımı"));
+                             gtk_label_new("📱 Dialpad"));
 
-    // ----- TAB 2: Son Görüşmeler -----
+    // ----- TAB 2: Recent Calls -----
     GtkWidget *recents_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(recents_page), 8);
 
     GtkWidget *recents_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(recents_page), recents_header, FALSE, FALSE, 0);
 
-    GtkWidget *recents_title = gtk_label_new("🕘 Son Görüşmeler");
+    GtkWidget *recents_title = gtk_label_new("🕘 Recent Calls");
     gtk_widget_set_halign(recents_title, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(recents_header), recents_title, TRUE, TRUE, 0);
 
-    sync_recents_btn = gtk_button_new_with_label("🔄 Eşitle");
+    sync_recents_btn = gtk_button_new_with_label("🔄 Sync");
     ctx = gtk_widget_get_style_context(sync_recents_btn);
     gtk_style_context_add_class(ctx, "sync-btn");
     g_signal_connect(sync_recents_btn, "clicked", G_CALLBACK(on_sync_recents_clicked), NULL);
@@ -4289,23 +4325,23 @@ static void create_ui(void) {
 
     GtkCellRenderer *recent_renderer = gtk_cell_renderer_text_new();
     GtkTreeViewColumn *type_col = gtk_tree_view_column_new_with_attributes(
-        "Tür", recent_renderer, "text", 0, NULL);
+        "Type", recent_renderer, "text", 0, NULL);
     gtk_tree_view_column_set_min_width(type_col, 60);
     gtk_tree_view_column_set_resizable(type_col, TRUE);
     gtk_tree_view_column_set_fixed_width(type_col, col_recent_type);
     g_signal_connect(type_col, "notify::width", G_CALLBACK(on_col_recent_type_width), NULL);
     GtkTreeViewColumn *rname_col = gtk_tree_view_column_new_with_attributes(
-        "Ad", recent_renderer, "text", 1, NULL);
+        "Name", recent_renderer, "text", 1, NULL);
     gtk_tree_view_column_set_resizable(rname_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rname_col, col_recent_name);
     g_signal_connect(rname_col, "notify::width", G_CALLBACK(on_col_recent_name_width), NULL);
     GtkTreeViewColumn *rnum_col = gtk_tree_view_column_new_with_attributes(
-        "Numara", recent_renderer, "text", 2, NULL);
+        "Number", recent_renderer, "text", 2, NULL);
     gtk_tree_view_column_set_resizable(rnum_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rnum_col, col_recent_number);
     g_signal_connect(rnum_col, "notify::width", G_CALLBACK(on_col_recent_number_width), NULL);
     GtkTreeViewColumn *rtime_col = gtk_tree_view_column_new_with_attributes(
-        "Zaman", recent_renderer, "text", 3, NULL);
+        "Time", recent_renderer, "text", 3, NULL);
     gtk_tree_view_column_set_resizable(rtime_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rtime_col, col_recent_time);
     g_signal_connect(rtime_col, "notify::width", G_CALLBACK(on_col_recent_time_width), NULL);
@@ -4319,28 +4355,28 @@ static void create_ui(void) {
     ctx = gtk_widget_get_style_context(recent_view);
     gtk_style_context_add_class(ctx, "list-view");
     
-    // Çift tıklama ile arama
+    // Double-click to call
     g_signal_connect(recent_view, "row-activated", G_CALLBACK(on_recent_row_activated), NULL);
-    // Sağ tıklama ile menü
+    // Right-click menu
     g_signal_connect(recent_view, "button-press-event", G_CALLBACK(on_recents_button_press), NULL);
 
     gtk_container_add(GTK_CONTAINER(recent_scroll), recent_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), recents_page, 
-                             gtk_label_new("🕘 Son Aramalar"));
+                             gtk_label_new("🕘 Recent Calls"));
 
-    // ----- TAB 3: Rehber -----
+    // ----- TAB 3: Contacts -----
     GtkWidget *contacts_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(contacts_page), 8);
 
     GtkWidget *contacts_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(contacts_page), contacts_header, FALSE, FALSE, 0);
 
-    GtkWidget *contacts_title = gtk_label_new("👥 Rehber");
+    GtkWidget *contacts_title = gtk_label_new("👥 Contacts");
     gtk_widget_set_halign(contacts_title, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(contacts_header), contacts_title, TRUE, TRUE, 0);
     
-    // Yenile butonu
-    GtkWidget *refresh_btn = gtk_button_new_with_label("🔄 Yenile");
+    // Refresh button
+    GtkWidget *refresh_btn = gtk_button_new_with_label("🔄 Refresh");
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_phonebook_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(contacts_header), refresh_btn, FALSE, FALSE, 0);
     
@@ -4348,12 +4384,12 @@ static void create_ui(void) {
     gtk_box_pack_end(GTK_BOX(contacts_header), contacts_spinner, FALSE, FALSE, 0);
     gtk_widget_set_no_show_all(contacts_spinner, TRUE);
 
-    // Arama kutusu + arama kutusu altında bilgi etiketi
+    // Search box + info label below search box
     GtkWidget *search_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_box_pack_start(GTK_BOX(contacts_page), search_box, FALSE, FALSE, 0);
     
     contacts_search_entry = gtk_search_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(contacts_search_entry), "İsim veya numara ara... (min 2 karakter)");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(contacts_search_entry), "Search name or number... (min 2 chars)");
     g_signal_connect(contacts_search_entry, "search-changed", G_CALLBACK(on_contacts_search_changed), NULL);
     gtk_box_pack_start(GTK_BOX(search_box), contacts_search_entry, TRUE, TRUE, 0);
 
@@ -4367,12 +4403,12 @@ static void create_ui(void) {
 
     GtkCellRenderer *contacts_renderer = gtk_cell_renderer_text_new();
     GtkTreeViewColumn *name_col = gtk_tree_view_column_new_with_attributes(
-        "Ad", contacts_renderer, "text", 0, NULL);
+        "Name", contacts_renderer, "text", 0, NULL);
     gtk_tree_view_column_set_resizable(name_col, TRUE);
     gtk_tree_view_column_set_fixed_width(name_col, col_contacts_name);
     g_signal_connect(name_col, "notify::width", G_CALLBACK(on_col_contacts_name_width), NULL);
     GtkTreeViewColumn *num_col = gtk_tree_view_column_new_with_attributes(
-        "Numara", contacts_renderer, "text", 1, NULL);
+        "Number", contacts_renderer, "text", 1, NULL);
     gtk_tree_view_column_set_resizable(num_col, TRUE);
     gtk_tree_view_column_set_fixed_width(num_col, col_contacts_number);
     g_signal_connect(num_col, "notify::width", G_CALLBACK(on_col_contacts_number_width), NULL);
@@ -4384,14 +4420,14 @@ static void create_ui(void) {
     ctx = gtk_widget_get_style_context(contacts_view);
     gtk_style_context_add_class(ctx, "list-view");
     
-    // Çift tıklama ile arama
+    // Double-click to call
     g_signal_connect(contacts_view, "row-activated", G_CALLBACK(on_contact_row_activated), NULL);
-    // Sağ tıklama ile menü
+    // Right-click menu
     g_signal_connect(contacts_view, "button-press-event", G_CALLBACK(on_contacts_button_press), NULL);
 
     gtk_container_add(GTK_CONTAINER(contacts_scroll), contacts_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), contacts_page, 
-                             gtk_label_new("👥 Rehber"));
+                             gtk_label_new("👥 Contacts"));
 
     // ----- TAB 4: Log -----
     GtkWidget *log_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -4422,14 +4458,32 @@ static void create_ui(void) {
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
-    load_settings();  // Sütun genişliklerini yükle
+    // tel: URI desteği - tarayıcılardan arama
+    if (argc > 1 && argv[1]) {
+        const char *arg = argv[1];
+        // tel:+905551234567 veya tel://+905551234567 formatı
+        if (strncmp(arg, "tel:", 4) == 0) {
+            arg += 4;
+            if (strncmp(arg, "//", 2) == 0) arg += 2;
+            // Numarayı temizle (sadece rakam ve + karakteri)
+            int j = 0;
+            for (int i = 0; arg[i] && j < 63; i++) {
+                if ((arg[i] >= '0' && arg[i] <= '9') || arg[i] == '+') {
+                    pending_dial_number[j++] = arg[i];
+                }
+            }
+            pending_dial_number[j] = '\0';
+        }
+    }
+
+    load_settings();  // Load column widths
     apply_css();
     create_ui();
 
-    // CSV'den hızlı yükleme
+    // Fast loading from CSV
     if (load_contacts_from_csv()) {
         phonebook_loaded = TRUE;
-        // all_contacts'tan contacts'a kopyala (arama için)
+        // Copy from all_contacts to contacts (for search)
         contacts_count = 0;
         for (int i = 0; i < all_contacts_count && contacts_count < 200; i++) {
             strncpy(contacts[contacts_count].name, all_contacts[i].name, 127);
@@ -4437,12 +4491,12 @@ int main(int argc, char *argv[]) {
             contacts_count++;
         }
         char msg[64];
-        snprintf(msg, sizeof(msg), "📂 CSV'den %d kişi yüklendi", all_contacts_count);
+        snprintf(msg, sizeof(msg), "📂 Loaded %d contacts from CSV", all_contacts_count);
         log_msg(msg);
     }
     if (load_recents_from_csv()) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "📂 CSV'den %d arama kaydı yüklendi", recent_count);
+        snprintf(msg, sizeof(msg), "📂 Loaded %d call records from CSV", recent_count);
         log_msg(msg);
     }
     
@@ -4461,8 +4515,8 @@ int main(int argc, char *argv[]) {
     gtk_widget_show_all(window);
     gtk_widget_hide(spinner);
 
-    log_msg("🎧 Bluetooth Kulaklık Simülatörü (Pasif Mod)");
-    log_msg("ℹ️ 'Başlat' butonuna basın, telefon bağlansın");
+    log_msg("🎧 Bluetooth Headset Simulator (Passive Mode)");
+    log_msg("ℹ️ Press 'Start' button, let phone connect");
 
     gtk_main();
 

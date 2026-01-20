@@ -59,16 +59,27 @@ install: $(TARGET_GUI)
 	@echo "Uygulama kuruluyor..."
 	sudo cp $(TARGET_GUI) /usr/local/bin/
 	sudo setcap 'cap_net_admin,cap_net_raw+eip' /usr/local/bin/$(TARGET_GUI)
-	@echo "✓ Kurulum tamamlandı! Artık 'bt_headset_gui' komutu ile çalıştırabilirsiniz."
+	@echo "tel: URI handler kaydediliyor..."
+	mkdir -p ~/.local/share/applications
+	cp bt_headset_gui.desktop ~/.local/share/applications/
+	xdg-mime default bt_headset_gui.desktop x-scheme-handler/tel
+	update-desktop-database ~/.local/share/applications 2>/dev/null || true
+	@echo "✓ Kurulum tamamlandı!"
+	@echo "  • 'bt_headset_gui' komutu ile çalıştırabilirsiniz"
+	@echo "  • Tarayıcılarda tel: linklerine tıklayınca otomatik arar"
 
 uninstall:
-	sudo rm -f /usr/local/bin/$(TARGET_GUI)
-	@echo "✓ Kaldırıldı"
+	@./scripts/uninstall.sh
+	@rm -f ~/.local/share/applications/bt_headset_gui.desktop
+	@update-desktop-database ~/.local/share/applications 2>/dev/null || true
+	@echo "✓ tel: handler kaldırıldı"
 
 help:
 	@echo ""
 	@echo "Kullanılabilir komutlar:"
-	@echo "  make gui    - GUI versiyonunu derle"
-	@echo "  make setup  - Bağımlılıkları kur"
-	@echo "  make run    - Kur + derle + çalıştır"
-	@echo "  make clean  - Temizle"
+	@echo "  make gui       - GUI versiyonunu derle"
+	@echo "  make setup     - Bağımlılıkları kur + sistem ayarları"
+	@echo "  make run       - Tek tıkla çalıştır (setup + derle + çalıştır)"
+	@echo "  make install   - Sisteme kur (/usr/local/bin)"
+	@echo "  make uninstall - Sistemi eski haline getir"
+	@echo "  make clean     - Temizle"
