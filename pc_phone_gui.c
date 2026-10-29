@@ -26,6 +26,15 @@
 #include <bluetooth/sdp_lib.h>
 #include <pulse/simple.h>
 #include <pulse/error.h>
+#include <locale.h>
+#include <glib/gi18n.h>
+
+#ifndef GETTEXT_PACKAGE
+#define GETTEXT_PACKAGE "pcphone"
+#endif
+#ifndef LOCALEDIR
+#define LOCALEDIR "/usr/local/share/locale"
+#endif
 
 #ifdef HAVE_WEBRTC_APM
 #include "audio_processing_wrapper.h"
@@ -177,6 +186,7 @@ static GtkListStore *contacts_store;
 static GtkWidget *recent_view;
 static GtkListStore *recent_store;
 static GtkWidget *log_view;
+static GtkWidget *dial_entry = NULL;
 static GtkTextBuffer *log_buffer;
 static GtkWidget *spinner;
 
@@ -601,7 +611,7 @@ static void save_settings(void) {
     fclose(f);
 }
 
-// Autostart yönetimi
+// Autostart management
 static gboolean is_autostart_enabled(void) {
     char path[512];
     const char *home = getenv("HOME");
@@ -620,10 +630,10 @@ static void set_autostart(gboolean enable) {
     snprintf(autostart_file, sizeof(autostart_file), "%s/pcphone.desktop", autostart_dir);
     
     if (enable) {
-        // Dizin yoksa oluştur
+        // Create directory if missing
         mkdir(autostart_dir, 0755);
         
-        // .desktop dosyası oluştur
+        // Create .desktop file
         FILE *f = fopen(autostart_file, "w");
         if (f) {
             fprintf(f, "[Desktop Entry]\n");
@@ -641,7 +651,7 @@ static void set_autostart(gboolean enable) {
             autostart_enabled = TRUE;
         }
     } else {
-        // Dosyayı sil
+        // Delete file
         unlink(autostart_file);
         autostart_enabled = FALSE;
     }
@@ -660,7 +670,7 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     save_settings();
 }
 
-// Sütun genişlik değişim callback'leri
+// Column width change callbacks
 static void on_col_recent_type_width(GObject *obj, GParamSpec *pspec, gpointer data) {
     (void)pspec; (void)data;
     col_recent_type = gtk_tree_view_column_get_width(GTK_TREE_VIEW_COLUMN(obj));
@@ -3053,7 +3063,7 @@ static void dial_number(const char *number) {
         gtk_message_dialog_format_secondary_text(
             GTK_MESSAGE_DIALOG(dialog),
             "HFP connection failed.\nNumber copied to clipboard.");
-        gtk_window_set_title(GTK_WINDOW(dialog), "Call");
+        gtk_window_set_title(GTK_WINDOW(dialog), _("Call"));
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
     }
@@ -4363,7 +4373,7 @@ static void apply_css(void) {
 
 static void create_ui(void) {
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "PcPhone");
+    gtk_window_set_title(GTK_WINDOW(window), _("PcPhone"));
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 650);
     gtk_container_set_border_width(GTK_CONTAINER(window), 12);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
@@ -4376,12 +4386,12 @@ static void create_ui(void) {
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(main_vbox), header_box, FALSE, FALSE, 0);
 
-    GtkWidget *title = gtk_label_new("🎧 PcPhone");
+    GtkWidget *title = gtk_label_new(_("🎧 PcPhone"));
     GtkStyleContext *ctx = gtk_widget_get_style_context(title);
     gtk_style_context_add_class(ctx, "title");
     gtk_box_pack_start(GTK_BOX(header_box), title, FALSE, FALSE, 0);
 
-    state_label = gtk_label_new("⚪ Ready");
+    state_label = gtk_label_new(_("⚪ Ready"));
     gtk_widget_set_halign(state_label, GTK_ALIGN_END);
     gtk_box_pack_end(GTK_BOX(header_box), state_label, FALSE, FALSE, 0);
 
@@ -4392,19 +4402,19 @@ static void create_ui(void) {
     GtkWidget *ctrl_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(main_vbox), ctrl_box, FALSE, FALSE, 0);
 
-    start_btn = gtk_button_new_with_label("▶ Start");
+    start_btn = gtk_button_new_with_label(_("▶ Start"));
     ctx = gtk_widget_get_style_context(start_btn);
     gtk_style_context_add_class(ctx, "btn-start");
     g_signal_connect(start_btn, "clicked", G_CALLBACK(on_start_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), start_btn, TRUE, TRUE, 0);
 
-    stop_btn = gtk_button_new_with_label("⏹ Stop");
+    stop_btn = gtk_button_new_with_label(_("⏹ Stop"));
     ctx = gtk_widget_get_style_context(stop_btn);
     gtk_style_context_add_class(ctx, "btn-stop");
     g_signal_connect(stop_btn, "clicked", G_CALLBACK(on_stop_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), stop_btn, TRUE, TRUE, 0);
 
-    disconnect_btn = gtk_button_new_with_label("🔌 Disconnect");
+    disconnect_btn = gtk_button_new_with_label(_("🔌 Disconnect"));
     g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(ctrl_box), disconnect_btn, TRUE, TRUE, 0);
 
@@ -4414,7 +4424,7 @@ static void create_ui(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(info_label), "info-label");
     gtk_box_pack_start(GTK_BOX(main_vbox), info_label, FALSE, FALSE, 0);
 
-    call_status_label = gtk_label_new("📞 No call");
+    call_status_label = gtk_label_new(_("📞 No call"));
     gtk_label_set_xalign(GTK_LABEL(call_status_label), 0.5);  // Center
     gtk_label_set_use_markup(GTK_LABEL(call_status_label), TRUE);
     gtk_label_set_justify(GTK_LABEL(call_status_label), GTK_JUSTIFY_CENTER);
@@ -4425,27 +4435,27 @@ static void create_ui(void) {
     GtkWidget *call_btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(main_vbox), call_btn_box, FALSE, FALSE, 0);
 
-    answer_btn = gtk_button_new_with_label("✅ Answer");
+    answer_btn = gtk_button_new_with_label(_("✅ Answer"));
     gtk_style_context_add_class(gtk_widget_get_style_context(answer_btn), "btn-answer");
     g_signal_connect(answer_btn, "clicked", G_CALLBACK(on_answer_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), answer_btn, TRUE, TRUE, 0);
 
-    reject_btn = gtk_button_new_with_label("❌ Reject");
+    reject_btn = gtk_button_new_with_label(_("❌ Reject"));
     gtk_style_context_add_class(gtk_widget_get_style_context(reject_btn), "btn-reject");
     g_signal_connect(reject_btn, "clicked", G_CALLBACK(on_reject_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), reject_btn, TRUE, TRUE, 0);
 
-    hangup_btn = gtk_button_new_with_label("🔚 Hang up");
+    hangup_btn = gtk_button_new_with_label(_("🔚 Hang up"));
     gtk_style_context_add_class(gtk_widget_get_style_context(hangup_btn), "btn-reject");
     g_signal_connect(hangup_btn, "clicked", G_CALLBACK(on_hangup_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(call_btn_box), hangup_btn, TRUE, TRUE, 0);
 
     GtkWidget *donate_btn = gtk_link_button_new_with_label(
         "https://buymeacoffee.com/ancientcoder",
-        "❤️ Donate");
+        _("❤️ Donate"));
     gtk_box_pack_start(GTK_BOX(call_btn_box), donate_btn, TRUE, TRUE, 0);
     // Autostart checkbox
-    GtkWidget *autostart_check = gtk_check_button_new_with_label("🚀 Autostart");
+    GtkWidget *autostart_check = gtk_check_button_new_with_label(_("🚀 Autostart"));
     autostart_enabled = is_autostart_enabled();  // Check the actual status
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart_check), autostart_enabled);
     g_signal_connect(autostart_check, "toggled", G_CALLBACK(on_autostart_toggled), NULL);
@@ -4460,8 +4470,8 @@ static void create_ui(void) {
     GtkWidget *dialpad_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(dialpad_page), 8);
     
-    GtkWidget *dial_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(dial_entry), "Enter number...");
+    dial_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(dial_entry), _("Enter number..."));
     gtk_entry_set_alignment(GTK_ENTRY(dial_entry), 0.5);
     gtk_widget_set_size_request(dial_entry, -1, 40);
     ctx = gtk_widget_get_style_context(dial_entry);
@@ -4486,16 +4496,17 @@ static void create_ui(void) {
         gtk_grid_attach(GTK_GRID(dialpad_grid), btn, i % 3, i / 3, 1, 1);
     }
 
-    GtkWidget *call_btn = gtk_button_new_with_label("📞 Call");
+    GtkWidget *call_btn = gtk_button_new_with_label(_("📞 Call"));
     gtk_widget_set_size_request(call_btn, 220, 50);
     ctx = gtk_widget_get_style_context(call_btn);
     gtk_style_context_add_class(ctx, "btn-start");
     g_object_set_data(G_OBJECT(call_btn), "entry", dial_entry);
     g_signal_connect(call_btn, "clicked", G_CALLBACK(on_dial_call_clicked), dial_entry);
+    g_signal_connect(dial_entry, "activate", G_CALLBACK(on_dial_call_clicked), dial_entry);
     gtk_box_pack_start(GTK_BOX(dialpad_page), call_btn, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), dialpad_page, 
-                             gtk_label_new("📱 Dialpad"));
+                             gtk_label_new(_("📱 Dialpad")));
 
     // ----- TAB 2: Recent Calls -----
     GtkWidget *recents_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -4504,11 +4515,11 @@ static void create_ui(void) {
     GtkWidget *recents_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(recents_page), recents_header, FALSE, FALSE, 0);
 
-    GtkWidget *recents_title = gtk_label_new("🕘 Recent Calls");
+    GtkWidget *recents_title = gtk_label_new(_("🕘 Recent Calls"));
     gtk_widget_set_halign(recents_title, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(recents_header), recents_title, TRUE, TRUE, 0);
 
-    sync_recents_btn = gtk_button_new_with_label("🔄 Sync");
+    sync_recents_btn = gtk_button_new_with_label(_("🔄 Sync"));
     ctx = gtk_widget_get_style_context(sync_recents_btn);
     gtk_style_context_add_class(ctx, "sync-btn");
     g_signal_connect(sync_recents_btn, "clicked", G_CALLBACK(on_sync_recents_clicked), NULL);
@@ -4528,23 +4539,23 @@ static void create_ui(void) {
 
     GtkCellRenderer *recent_renderer = gtk_cell_renderer_text_new();
     GtkTreeViewColumn *type_col = gtk_tree_view_column_new_with_attributes(
-        "Type", recent_renderer, "text", 0, NULL);
+        _("Type"), recent_renderer, "text", 0, NULL);
     gtk_tree_view_column_set_min_width(type_col, 60);
     gtk_tree_view_column_set_resizable(type_col, TRUE);
     gtk_tree_view_column_set_fixed_width(type_col, col_recent_type);
     g_signal_connect(type_col, "notify::width", G_CALLBACK(on_col_recent_type_width), NULL);
     GtkTreeViewColumn *rname_col = gtk_tree_view_column_new_with_attributes(
-        "Name", recent_renderer, "text", 1, NULL);
+        _("Name"), recent_renderer, "text", 1, NULL);
     gtk_tree_view_column_set_resizable(rname_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rname_col, col_recent_name);
     g_signal_connect(rname_col, "notify::width", G_CALLBACK(on_col_recent_name_width), NULL);
     GtkTreeViewColumn *rnum_col = gtk_tree_view_column_new_with_attributes(
-        "Number", recent_renderer, "text", 2, NULL);
+        _("Number"), recent_renderer, "text", 2, NULL);
     gtk_tree_view_column_set_resizable(rnum_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rnum_col, col_recent_number);
     g_signal_connect(rnum_col, "notify::width", G_CALLBACK(on_col_recent_number_width), NULL);
     GtkTreeViewColumn *rtime_col = gtk_tree_view_column_new_with_attributes(
-        "Time", recent_renderer, "text", 3, NULL);
+        _("Time"), recent_renderer, "text", 3, NULL);
     gtk_tree_view_column_set_resizable(rtime_col, TRUE);
     gtk_tree_view_column_set_fixed_width(rtime_col, col_recent_time);
     g_signal_connect(rtime_col, "notify::width", G_CALLBACK(on_col_recent_time_width), NULL);
@@ -4565,7 +4576,7 @@ static void create_ui(void) {
 
     gtk_container_add(GTK_CONTAINER(recent_scroll), recent_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), recents_page, 
-                             gtk_label_new("🕘 Recent Calls"));
+                             gtk_label_new(_("🕘 Recent Calls")));
 
     // ----- TAB 3: Contacts -----
     GtkWidget *contacts_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -4574,12 +4585,12 @@ static void create_ui(void) {
     GtkWidget *contacts_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(contacts_page), contacts_header, FALSE, FALSE, 0);
 
-    GtkWidget *contacts_title = gtk_label_new("👥 Contacts");
+    GtkWidget *contacts_title = gtk_label_new(_("👥 Contacts"));
     gtk_widget_set_halign(contacts_title, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(contacts_header), contacts_title, TRUE, TRUE, 0);
     
     // Refresh button
-    GtkWidget *refresh_btn = gtk_button_new_with_label("🔄 Refresh");
+    GtkWidget *refresh_btn = gtk_button_new_with_label(_("🔄 Refresh"));
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_phonebook_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(contacts_header), refresh_btn, FALSE, FALSE, 0);
     
@@ -4592,7 +4603,7 @@ static void create_ui(void) {
     gtk_box_pack_start(GTK_BOX(contacts_page), search_box, FALSE, FALSE, 0);
     
     contacts_search_entry = gtk_search_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(contacts_search_entry), "Search name or number... (min 2 chars)");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(contacts_search_entry), _("Search name or number... (min 2 chars)"));
     g_signal_connect(contacts_search_entry, "search-changed", G_CALLBACK(on_contacts_search_changed), NULL);
     gtk_box_pack_start(GTK_BOX(search_box), contacts_search_entry, TRUE, TRUE, 0);
 
@@ -4606,12 +4617,12 @@ static void create_ui(void) {
 
     GtkCellRenderer *contacts_renderer = gtk_cell_renderer_text_new();
     GtkTreeViewColumn *name_col = gtk_tree_view_column_new_with_attributes(
-        "Name", contacts_renderer, "text", 0, NULL);
+        _("Name"), contacts_renderer, "text", 0, NULL);
     gtk_tree_view_column_set_resizable(name_col, TRUE);
     gtk_tree_view_column_set_fixed_width(name_col, col_contacts_name);
     g_signal_connect(name_col, "notify::width", G_CALLBACK(on_col_contacts_name_width), NULL);
     GtkTreeViewColumn *num_col = gtk_tree_view_column_new_with_attributes(
-        "Number", contacts_renderer, "text", 1, NULL);
+        _("Number"), contacts_renderer, "text", 1, NULL);
     gtk_tree_view_column_set_resizable(num_col, TRUE);
     gtk_tree_view_column_set_fixed_width(num_col, col_contacts_number);
     g_signal_connect(num_col, "notify::width", G_CALLBACK(on_col_contacts_number_width), NULL);
@@ -4630,7 +4641,7 @@ static void create_ui(void) {
 
     gtk_container_add(GTK_CONTAINER(contacts_scroll), contacts_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), contacts_page, 
-                             gtk_label_new("👥 Contacts"));
+                             gtk_label_new(_("👥 Contacts")));
 
     // ----- TAB 4: Log -----
     GtkWidget *log_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -4651,7 +4662,7 @@ static void create_ui(void) {
 
     gtk_container_add(GTK_CONTAINER(log_scroll), log_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), log_page, 
-                             gtk_label_new("📋 Log"));
+                             gtk_label_new(_("📋 Log")));
 }
 
 // ============================================================================
@@ -4661,31 +4672,31 @@ static void create_ui(void) {
 static void on_app_activate(GtkApplication *application, gpointer user_data) {
     (void)user_data;
     
-    // Eğer pencere zaten varsa, öne getir
+    // If window already exists, bring to front
     if (window) {
         gtk_window_present(GTK_WINDOW(window));
         
-        // Eğer tel: URI ile çağrıldıysa, numarayı işle
+            // Write number from tel: URI into input field
         if (pending_uri_arg[0] != '\0') {
             strncpy(pending_dial_number, pending_uri_arg, 63);
             pending_dial_number[63] = '\0';
             pending_uri_arg[0] = '\0';
-            
-            // Eğer bağlıysa hemen ara
-            if (current_state == STATE_CONNECTED && hfp_socket >= 0) {
-                dial_number(pending_dial_number);
-                pending_dial_number[0] = '\0';
+
+            if (dial_entry) {
+                gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_dial_number);
+                gtk_widget_grab_focus(dial_entry);
             }
+            pending_dial_number[0] = '\0';
         }
         return;
     }
     
-    // İlk açılış - UI oluştur
+    // First launch - create UI
     load_settings();
     apply_css();
     create_ui();
     
-    // Pencereyi uygulamaya bağla
+    // Bind window to application
     gtk_application_add_window(application, GTK_WINDOW(window));
 
     // Fast loading from CSV
@@ -4710,6 +4721,18 @@ static void on_app_activate(GtkApplication *application, gpointer user_data) {
     refresh_contacts_view();
     refresh_recents_view();
 
+    // Write number received via tel: URI into input field
+    if (pending_uri_arg[0] != '\0') {
+        strncpy(pending_dial_number, pending_uri_arg, 63);
+        pending_dial_number[63] = '\0';
+        pending_uri_arg[0] = '\0';
+        if (dial_entry) {
+            gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_dial_number);
+            gtk_widget_grab_focus(dial_entry);
+        }
+        pending_dial_number[0] = '\0';
+    }
+
     if (!init_dbus()) {
         set_state(STATE_ERROR);
     } else {
@@ -4733,7 +4756,7 @@ static void on_app_command_line(GApplication *application, GApplicationCommandLi
     gint argc;
     argv = g_application_command_line_get_arguments(cmdline, &argc);
     
-    // tel: URI kontrolü
+    // Check tel: URI
     if (argc > 1 && argv[1]) {
         const char *arg = argv[1];
         if (strncmp(arg, "tel:", 4) == 0) {
@@ -4755,10 +4778,88 @@ static void on_app_command_line(GApplication *application, GApplicationCommandLi
 }
 
 // ============================================================================
+// I18N
+// ============================================================================
+
+// Initialize gettext. NOTE: only the LAST bindtextdomain() call for a domain
+// takes effect (they overwrite each other), so we must pick exactly ONE
+// directory that actually contains the .mo catalog.
+static void init_i18n(void) {
+    setlocale(LC_ALL, "");
+
+    // Current language, e.g. "it_IT" / "it" from "it_IT.UTF-8"
+    const char *lang = getenv("LANGUAGE");
+    if (!lang || !*lang) lang = getenv("LC_ALL");
+    if (!lang || !*lang) lang = getenv("LC_MESSAGES");
+    if (!lang || !*lang) lang = getenv("LANG");
+
+    char lang_full[32] = {0};  // e.g. "it_IT"
+    char lang_short[32] = {0}; // e.g. "it"
+    if (lang && *lang) {
+        snprintf(lang_full, sizeof(lang_full), "%s", lang);
+        char *sep = strpbrk(lang_full, ".@");
+        if (sep) *sep = '\0';
+        snprintf(lang_short, sizeof(lang_short), "%s", lang_full);
+        char *us = strchr(lang_short, '_');
+        if (us) *us = '\0';
+    }
+
+    // Executable directory (works regardless of cwd and with sudo)
+    char exe_dir[512] = {0};
+    ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (len > 0) {
+        exe_dir[len] = '\0';
+        char *slash = strrchr(exe_dir, '/');
+        if (slash) *slash = '\0';
+    }
+
+    gchar *cwd = g_get_current_dir();
+
+    const char *dirs[4];
+    int ndirs = 0;
+    static char d_exe_locale[600], d_cwd_locale[600];
+    if (exe_dir[0]) {
+        snprintf(d_exe_locale, sizeof(d_exe_locale), "%s/locale", exe_dir);
+        dirs[ndirs++] = d_exe_locale;   // <exe dir>/locale/it/LC_MESSAGES/pcphone.mo
+    }
+    snprintf(d_cwd_locale, sizeof(d_cwd_locale), "%s/locale", cwd);
+    dirs[ndirs++] = d_cwd_locale;       // ./locale/it/LC_MESSAGES/pcphone.mo
+    dirs[ndirs++] = LOCALEDIR;          // installed via make install
+    dirs[ndirs++] = "/usr/share/locale";
+
+    bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8");
+
+    // Bind to the FIRST directory that really contains the catalog
+    gboolean bound = FALSE;
+    const char *codes[2] = {lang_full, lang_short};
+    for (int c = 0; c < 2 && !bound; c++) {
+        if (!codes[c][0]) continue;
+        for (int i = 0; i < ndirs && !bound; i++) {
+            char test[768];
+            snprintf(test, sizeof(test), "%s/%s/LC_MESSAGES/" GETTEXT_PACKAGE ".mo",
+                     dirs[i], codes[c]);
+            if (access(test, R_OK) == 0) {
+                bindtextdomain(GETTEXT_PACKAGE, dirs[i]);
+                bound = TRUE;
+            }
+        }
+    }
+    if (!bound) {
+        // No catalog found: English (msgid) is used as fallback
+        bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR);
+    }
+
+    textdomain(GETTEXT_PACKAGE);
+    g_free(cwd);
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
 int main(int argc, char *argv[]) {
+    init_i18n();
+
     // Initialize data paths for snap or regular environment
     init_data_paths();
     
@@ -4771,7 +4872,7 @@ int main(int argc, char *argv[]) {
         flags |= G_APPLICATION_NON_UNIQUE;
     }
     
-    // GtkApplication oluştur
+    // Create GtkApplication
     app = gtk_application_new("com.ancientcoder.pcphone", flags);
     
     g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), NULL);

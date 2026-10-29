@@ -1,0 +1,95 @@
+# Italian translations for pcphone
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the PACKAGE package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: pcphone\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-10-26 22:59+0000\n"
+"PO-Revision-Date: 2026-10-27 00:04+0100\n"
+"Last-Translator: \n"
+"Language-Team: Italian\n"
+"Language: it\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: Poedit 3.0.1\n"
+
+msgid "PcPhone"
+msgstr "PcPhone"
+
+msgid "🎧 PcPhone"
+msgstr "🎧 PcPhone"
+
+msgid "⚪ Ready"
+msgstr "⚪ Pronto"
+
+msgid "▶ Start"
+msgstr "▶ Avvia"
+
+msgid "⏹ Stop"
+msgstr "⏹ Ferma"
+
+msgid "🔌 Disconnect"
+msgstr "🔌 Disconnetti"
+
+msgid "📞 No call"
+msgstr "📞 Nessuna chiamata"
+
+msgid "✅ Answer"
+msgstr "✅ Rispondi"
+
+msgid "❌ Reject"
+msgstr "❌ Rifiuta"
+
+msgid "🔚 Hang up"
+msgstr "🔚 Riaggancia"
+
+msgid "❤️ Donate"
+msgstr "❤️ Dona"
+
+msgid "🚀 Autostart"
+msgstr "🚀 Avvio automatico"
+
+msgid "Enter number..."
+msgstr "Inserisci numero..."
+
+msgid "📞 Call"
+msgstr "📞 Chiama"
+
+msgid "📱 Dialpad"
+msgstr "📱 Tastierino"
+
+msgid "🕘 Recent Calls"
+msgstr "🕘 Chiamate recenti"
+
+msgid "🔄 Sync"
+msgstr "🔄 Sincronizza"
+
+msgid "Type"
+msgstr "Tipo"
+
+msgid "Name"
+msgstr "Nome"
+
+msgid "Number"
+msgstr "Numero"
+
+msgid "Time"
+msgstr "Ora"
+
+msgid "👥 Contacts"
+msgstr "👥 Contatti"
+
+msgid "🔄 Refresh"
+msgstr "🔄 Aggiorna"
+
+msgid "Search name or number... (min 2 chars)"
+msgstr "Cerca nome o numero... (min 2 caratteri)"
+
+msgid "📋 Log"
+msgstr "📋 Registro"
+
+msgid "Call"
+msgstr "Chiamata"
