@@ -187,6 +187,7 @@ static GtkWidget *recent_view;
 static GtkListStore *recent_store;
 static GtkWidget *log_view;
 static GtkWidget *dial_entry = NULL;
+static GtkWidget *main_notebook = NULL;
 static GtkTextBuffer *log_buffer;
 static GtkWidget *spinner;
 
@@ -4465,6 +4466,7 @@ static void create_ui(void) {
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
     gtk_box_pack_start(GTK_BOX(main_vbox), notebook, TRUE, TRUE, 0);
+    main_notebook = notebook;
 
     // ----- TAB 1: Dialpad -----
     GtkWidget *dialpad_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -4669,24 +4671,37 @@ static void create_ui(void) {
 // APPLICATION CALLBACKS
 // ============================================================================
 
+// Give keyboard focus to the dial entry once the window is mapped
+// (grab_focus before show_all/present completes has no effect in GTK3)
+static gboolean focus_dial_entry_idle(gpointer data) {
+    (void)data;
+    if (window && !gtk_widget_get_mapped(window)) {
+        return G_SOURCE_CONTINUE;
+    }
+    if (dial_entry) {
+        gtk_widget_grab_focus(dial_entry);
+        gtk_editable_set_position(GTK_EDITABLE(dial_entry), -1);
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static void on_app_activate(GtkApplication *application, gpointer user_data) {
     (void)user_data;
-    
+
     // If window already exists, bring to front
     if (window) {
         gtk_window_present(GTK_WINDOW(window));
-        
-            // Write number from tel: URI into input field
-        if (pending_uri_arg[0] != '\0') {
-            strncpy(pending_dial_number, pending_uri_arg, 63);
-            pending_dial_number[63] = '\0';
-            pending_uri_arg[0] = '\0';
 
+        // Write number from tel: URI into input field
+        if (pending_uri_arg[0] != '\0') {
             if (dial_entry) {
-                gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_dial_number);
-                gtk_widget_grab_focus(dial_entry);
+                gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_uri_arg);
             }
-            pending_dial_number[0] = '\0';
+            pending_uri_arg[0] = '\0';
+            if (main_notebook) {
+                gtk_notebook_set_current_page(GTK_NOTEBOOK(main_notebook), 0);
+            }
+            g_idle_add(focus_dial_entry_idle, NULL);
         }
         return;
     }
@@ -4723,14 +4738,13 @@ static void on_app_activate(GtkApplication *application, gpointer user_data) {
 
     // Write number received via tel: URI into input field
     if (pending_uri_arg[0] != '\0') {
-        strncpy(pending_dial_number, pending_uri_arg, 63);
-        pending_dial_number[63] = '\0';
-        pending_uri_arg[0] = '\0';
         if (dial_entry) {
-            gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_dial_number);
-            gtk_widget_grab_focus(dial_entry);
+            gtk_entry_set_text(GTK_ENTRY(dial_entry), pending_uri_arg);
         }
-        pending_dial_number[0] = '\0';
+        pending_uri_arg[0] = '\0';
+        if (main_notebook) {
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(main_notebook), 0);
+        }
     }
 
     if (!init_dbus()) {
@@ -4744,6 +4758,9 @@ static void on_app_activate(GtkApplication *application, gpointer user_data) {
     update_ui();
     gtk_widget_show_all(window);
     gtk_widget_hide(spinner);
+
+    // Focus dial entry at every startup (deferred until the window is mapped)
+    g_idle_add(focus_dial_entry_idle, NULL);
 
     log_msg("📱 PcPhone - Ready");
     log_msg("ℹ️ Press 'Start' button, let phone connect");
